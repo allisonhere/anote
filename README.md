@@ -14,7 +14,21 @@ Keyboard-first TUI note-taking app in Rust.
 - Collapsible notes pane with scrollable preview
 - Command palette (`:`), quick CLI capture, CLI search
 
-## Usage
+## Installation
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/allisonhere/anote/master/install.sh | bash
+```
+
+Installs to `~/.local/bin` (or `/usr/local/bin`). Override the location:
+
+```bash
+ANOTE_INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/allisonhere/anote/master/install.sh | bash
+```
+
+Supported platforms: Linux and macOS, x86_64 and aarch64.
+
+## Build from source
 
 ```bash
 cargo build --release
