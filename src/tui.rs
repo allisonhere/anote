@@ -52,6 +52,7 @@ enum Mode {
     Command,
     Find,
     Help,
+    FolderPick,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,6 +522,9 @@ pub struct App {
     folder_list: Vec<String>,   // distinct non-empty folder names
     folder_cursor: usize,       // 0 = All Notes, 1+ = folder_list[i-1]
     sidebar_folder: Option<String>,
+    folder_pick_cursor: usize,
+    folder_pick_input: String,
+    folder_pick_typing: bool,
 }
 
 impl App {
@@ -575,6 +579,9 @@ impl App {
             folder_list: Vec::new(),
             folder_cursor: 0,
             sidebar_folder: None,
+            folder_pick_cursor: 0,
+            folder_pick_input: String::new(),
+            folder_pick_typing: false,
         };
         app.apply_editor_keymap();
         app.refresh_notes()?;
@@ -716,6 +723,7 @@ impl App {
             Mode::Search => self.handle_search_key(key),
             Mode::Command => self.handle_command_key(key),
             Mode::Find => self.handle_find_key(key),
+            Mode::FolderPick => self.handle_folder_pick_key(key),
             Mode::Help => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -967,6 +975,14 @@ impl App {
                 self.refresh_notes()?;
                 self.load_selected()?;
                 self.status = "Reloaded".to_string();
+            }
+            KeyCode::Char('f') => {
+                if self.active_note_id.is_some() {
+                    self.folder_pick_cursor = 0;
+                    self.folder_pick_input.clear();
+                    self.folder_pick_typing = false;
+                    self.mode = Mode::FolderPick;
+                }
             }
             KeyCode::Char('d') if !self.delete_pending => {
                 if self.active_note_id.is_some() {
@@ -1450,6 +1466,82 @@ impl App {
             }
         }
 
+        Ok(false)
+    }
+
+    fn handle_folder_pick_key(&mut self, key: KeyEvent) -> Result<bool> {
+        // Items: folder_list[0..n-1], then "New folder...", then "(remove folder)" if note has one
+        let note_has_folder = self.notes
+            .get(self.selected)
+            .map(|n| !n.folder.is_empty())
+            .unwrap_or(false);
+        let new_idx = self.folder_list.len();
+        let remove_idx = self.folder_list.len() + 1;
+        let total = self.folder_list.len() + 1 + if note_has_folder { 1 } else { 0 };
+
+        if self.folder_pick_typing {
+            match key.code {
+                KeyCode::Esc => {
+                    self.folder_pick_typing = false;
+                }
+                KeyCode::Enter => {
+                    let name = self.folder_pick_input.trim().to_string();
+                    if !name.is_empty() {
+                        if let Some(id) = self.active_note_id {
+                            self.store.set_folder(id, &name)?;
+                            self.refresh_notes()?;
+                            self.select_by_id(id);
+                            self.status = format!("Moved to folder: {}", name);
+                        }
+                    }
+                    self.mode = Mode::Normal;
+                }
+                KeyCode::Backspace => { self.folder_pick_input.pop(); }
+                KeyCode::Char(c) => { self.folder_pick_input.push(c); }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.folder_pick_cursor + 1 < total {
+                    self.folder_pick_cursor += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.folder_pick_cursor > 0 {
+                    self.folder_pick_cursor -= 1;
+                }
+            }
+            KeyCode::Enter => {
+                if self.folder_pick_cursor == new_idx {
+                    self.folder_pick_typing = true;
+                    self.folder_pick_input.clear();
+                } else if note_has_folder && self.folder_pick_cursor == remove_idx {
+                    if let Some(id) = self.active_note_id {
+                        self.store.set_folder(id, "")?;
+                        self.refresh_notes()?;
+                        self.select_by_id(id);
+                        self.status = "Folder removed".to_string();
+                    }
+                    self.mode = Mode::Normal;
+                } else if self.folder_pick_cursor < self.folder_list.len() {
+                    let name = self.folder_list[self.folder_pick_cursor].clone();
+                    if let Some(id) = self.active_note_id {
+                        self.store.set_folder(id, &name)?;
+                        self.refresh_notes()?;
+                        self.select_by_id(id);
+                        self.status = format!("Moved to folder: {}", name);
+                    }
+                    self.mode = Mode::Normal;
+                }
+            }
+            _ => {}
+        }
         Ok(false)
     }
 
@@ -2703,7 +2795,7 @@ impl App {
             Mode::Search => " Preview ",
             Mode::Command => " Preview ",
             Mode::Find => " Edit (find) ",
-            Mode::Help => " Preview ",
+            Mode::Help | Mode::FolderPick => " Preview ",
         };
 
         let editor_border_color = if self.mode == Mode::Edit {
@@ -2803,6 +2895,7 @@ impl App {
             Mode::Command => "COMMAND",
             Mode::Find => "FIND",
             Mode::Help => "HELP",
+            Mode::FolderPick => "FOLDER",
         };
         let dirty_text = if self.dirty { "*" } else { "" };
 
@@ -2829,6 +2922,7 @@ impl App {
                 )
             }
             Mode::Help => "  j/k scroll  Esc/? close".to_string(),
+            Mode::FolderPick => "  j/k navigate  Enter select  Esc cancel".to_string(),
             _ => {
                 format!(
                     "[{mode}] {status} {dirty} | : command  n new  d delete  \\ pane | F6 theme | F7 keymap | ? help | q quit",
@@ -2858,7 +2952,79 @@ impl App {
         if self.mode == Mode::Help {
             self.render_help_overlay(frame, palette);
         }
+        if self.mode == Mode::FolderPick {
+            self.render_folder_pick_overlay(frame, palette);
+        }
 
+    }
+
+    fn render_folder_pick_overlay(&mut self, frame: &mut Frame, palette: Palette) {
+        let note_has_folder = self.notes
+            .get(self.selected)
+            .map(|n| !n.folder.is_empty())
+            .unwrap_or(false);
+
+        // Build item labels
+        let mut labels: Vec<String> = self.folder_list
+            .iter()
+            .map(|f| format!("  {}/", f))
+            .collect();
+        labels.push("  + New folder...".to_string());
+        if note_has_folder {
+            labels.push("  ✕ Remove from folder".to_string());
+        }
+
+        let area = frame.area();
+        let w = 36u16.min(area.width);
+        let h = (labels.len() as u16 + 2 + if self.folder_pick_typing { 2 } else { 0 }).min(area.height);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect { x, y, width: w, height: h };
+
+        frame.render_widget(Clear, popup);
+
+        let block = Block::default()
+            .title(" Move to Folder ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.accent))
+            .style(Style::default().bg(palette.bg).fg(palette.text));
+
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        // Split inner: list on top, input at bottom when typing
+        let (list_area, input_area) = if self.folder_pick_typing {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(inner);
+            (split[0], Some(split[1]))
+        } else {
+            (inner, None)
+        };
+
+        let new_idx = self.folder_list.len();
+        let list_items: Vec<ListItem> = labels.iter().enumerate().map(|(i, label)| {
+            let is_cursor = i == self.folder_pick_cursor;
+            let is_new = i == new_idx;
+            let style = if is_cursor {
+                Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD)
+            } else if is_new {
+                Style::default().fg(palette.accent)
+            } else {
+                Style::default().fg(palette.text)
+            };
+            ListItem::new(TSpan::styled(label.clone(), style))
+        }).collect();
+
+        frame.render_widget(List::new(list_items), list_area);
+
+        if let Some(input_area) = input_area {
+            let input_text = format!("> {}_", self.folder_pick_input);
+            let input = Paragraph::new(input_text)
+                .style(Style::default().fg(palette.accent));
+            frame.render_widget(input, input_area);
+        }
     }
 
     fn render_help_overlay(&mut self, frame: &mut Frame, palette: Palette) {
@@ -2902,6 +3068,7 @@ impl App {
             row(":",               "command palette"),
             row("\\",              "toggle notes pane"),
             row("Tab",             "focus folder browser"),
+            row("f",               "move note to folder"),
             row("q",               "quit"),
             row("#tag in body",    "add tag to note"),
             pad(),
@@ -2909,6 +3076,8 @@ impl App {
             row("j/k",             "navigate folders"),
             row("Enter",           "select folder / focus notes"),
             row("Tab",             "switch focus back to notes"),
+            row(":folder <name>",  "assign note to folder"),
+            row(":folder",         "remove note from folder"),
             pad(),
             heading("  COLLAPSED PANE"),
             row("j/k  ↑↓",        "scroll preview"),
