@@ -212,7 +212,7 @@ struct Palette {
     ok: Color,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct EditorBuffer {
     lines: Vec<String>,
     cursor_row: usize,
@@ -372,6 +372,53 @@ impl EditorBuffer {
     fn byte_idx_at_cursor(&self) -> usize {
         byte_idx_from_char_idx(&self.lines[self.cursor_row], self.cursor_col)
     }
+
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    fn move_word_left(&mut self) {
+        if self.cursor_col == 0 {
+            if self.cursor_row > 0 {
+                self.cursor_row -= 1;
+                self.cursor_col = self.current_line_len();
+            }
+            return;
+        }
+        let line: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        let mut col = self.cursor_col;
+        // skip whitespace/non-word to the left
+        while col > 0 && !Self::is_word_char(line[col - 1]) {
+            col -= 1;
+        }
+        // skip word chars to the left
+        while col > 0 && Self::is_word_char(line[col - 1]) {
+            col -= 1;
+        }
+        self.cursor_col = col;
+    }
+
+    fn move_word_right(&mut self) {
+        let line_len = self.current_line_len();
+        if self.cursor_col >= line_len {
+            if self.cursor_row + 1 < self.lines.len() {
+                self.cursor_row += 1;
+                self.cursor_col = 0;
+            }
+            return;
+        }
+        let line: Vec<char> = self.lines[self.cursor_row].chars().collect();
+        let mut col = self.cursor_col;
+        // skip word chars to the right
+        while col < line_len && Self::is_word_char(line[col]) {
+            col += 1;
+        }
+        // skip whitespace/non-word to the right
+        while col < line_len && !Self::is_word_char(line[col]) {
+            col += 1;
+        }
+        self.cursor_col = col;
+    }
 }
 
 fn byte_idx_from_char_idx(s: &str, char_idx: usize) -> usize {
@@ -445,9 +492,12 @@ pub struct App {
     last_edit: Option<Instant>,
     delete_pending: bool,
     editor_col_width: usize,
+    editor_row_height: usize,
     selection_anchor: Option<usize>,
     yank_buffer: String,
     clipboard: Option<Clipboard>,
+    undo_stack: Vec<EditorBuffer>,
+    redo_stack: Vec<EditorBuffer>,
 }
 
 impl App {
@@ -481,9 +531,12 @@ impl App {
             last_edit: None,
             delete_pending: false,
             editor_col_width: 80,
+            editor_row_height: 40,
             selection_anchor: None,
             yank_buffer: String::new(),
             clipboard: Clipboard::new().ok(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         };
         app.refresh_notes()?;
         app.load_selected()?;
@@ -798,11 +851,13 @@ impl App {
             return Ok(false);
         }
         if is_ctrl_char(&key, 'x') {
+            self.push_undo();
             self.copy_selection();
             self.delete_selection();
             return Ok(false);
         }
         if is_ctrl_char(&key, 'v') {
+            self.push_undo();
             self.delete_selection();
             let sys = self.clipboard_get().filter(|s| !s.is_empty());
             let text = sys.unwrap_or_else(|| self.yank_buffer.clone());
@@ -821,6 +876,27 @@ impl App {
             self.editor_buffer.cursor_row = row.min(self.editor_buffer.lines.len().saturating_sub(1));
             self.editor_buffer.cursor_col =
                 col.min(self.editor_buffer.lines[self.editor_buffer.cursor_row].chars().count());
+            return Ok(false);
+        }
+
+        if is_ctrl_char(&key, 'z') {
+            if let Some(snapshot) = self.undo_stack.pop() {
+                self.redo_stack.push(self.editor_buffer.clone());
+                self.editor_buffer = snapshot;
+                self.dirty = true;
+                self.last_edit = Some(Instant::now());
+                self.status = "Undo".to_string();
+            }
+            return Ok(false);
+        }
+        if is_ctrl_char(&key, 'y') {
+            if let Some(snapshot) = self.redo_stack.pop() {
+                self.undo_stack.push(self.editor_buffer.clone());
+                self.editor_buffer = snapshot;
+                self.dirty = true;
+                self.last_edit = Some(Instant::now());
+                self.status = "Redo".to_string();
+            }
             return Ok(false);
         }
 
@@ -913,6 +989,86 @@ impl App {
                         self.status = "VIM INSERT".to_string();
                         self.dirty = true;
                         self.last_edit = Some(Instant::now());
+                    }
+                    // Ctrl+Left/Right: word jump
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_flat_offset());
+                        }
+                        self.editor_buffer.move_word_left();
+                    }
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.selection_anchor = None;
+                        self.editor_buffer.move_word_left();
+                        self.clamp_cursor_for_vim_normal();
+                    }
+                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_flat_offset());
+                        }
+                        self.editor_buffer.move_word_right();
+                    }
+                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.selection_anchor = None;
+                        self.editor_buffer.move_word_right();
+                        self.clamp_cursor_for_vim_normal();
+                    }
+                    // Ctrl+Home/End: doc start/end
+                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_flat_offset());
+                        }
+                        self.editor_buffer.cursor_row = 0;
+                        self.editor_buffer.cursor_col = 0;
+                    }
+                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.selection_anchor = None;
+                        self.editor_buffer.cursor_row = 0;
+                        self.editor_buffer.cursor_col = 0;
+                    }
+                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_flat_offset());
+                        }
+                        self.editor_buffer.set_cursor_to_end();
+                    }
+                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.selection_anchor = None;
+                        self.editor_buffer.set_cursor_to_end();
+                    }
+                    // PageUp/PageDown
+                    KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_flat_offset());
+                        }
+                        self.move_page_down();
+                    }
+                    KeyCode::PageDown => {
+                        self.selection_anchor = None;
+                        self.move_page_down();
+                    }
+                    KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_flat_offset());
+                        }
+                        self.move_page_up();
+                    }
+                    KeyCode::PageUp => {
+                        self.selection_anchor = None;
+                        self.move_page_up();
+                    }
+                    // Shift+Home/End: extend selection
+                    KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_flat_offset());
+                        }
+                        self.editor_buffer.move_home();
+                    }
+                    KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.selection_anchor.is_none() {
+                            self.selection_anchor = Some(self.cursor_flat_offset());
+                        }
+                        self.editor_buffer.move_end();
                     }
                     // Shift+arrows: extend selection
                     KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1064,6 +1220,15 @@ impl App {
                         self.enter_vim_normal_mode("VIM NORMAL");
                     }
                     // Movements extend selection (do NOT clear anchor)
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => self.editor_buffer.move_word_left(),
+                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => self.editor_buffer.move_word_right(),
+                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.editor_buffer.cursor_row = 0;
+                        self.editor_buffer.cursor_col = 0;
+                    }
+                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => self.editor_buffer.set_cursor_to_end(),
+                    KeyCode::PageDown => self.move_page_down(),
+                    KeyCode::PageUp => self.move_page_up(),
                     KeyCode::Char('h') | KeyCode::Left => self.editor_buffer.move_left(),
                     KeyCode::Char('j') | KeyCode::Down => self.move_visual_down(),
                     KeyCode::Char('k') | KeyCode::Up => self.move_visual_up(),
@@ -1089,7 +1254,72 @@ impl App {
 
     fn apply_insert_key(&mut self, key: KeyEvent) {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            // Ctrl+Left/Right: word jump
+            KeyCode::Left if ctrl => {
+                if shift {
+                    if self.selection_anchor.is_none() {
+                        self.selection_anchor = Some(self.cursor_flat_offset());
+                    }
+                } else {
+                    self.selection_anchor = None;
+                }
+                self.editor_buffer.move_word_left();
+            }
+            KeyCode::Right if ctrl => {
+                if shift {
+                    if self.selection_anchor.is_none() {
+                        self.selection_anchor = Some(self.cursor_flat_offset());
+                    }
+                } else {
+                    self.selection_anchor = None;
+                }
+                self.editor_buffer.move_word_right();
+            }
+            // Ctrl+Home/End: jump to doc start/end
+            KeyCode::Home if ctrl => {
+                if shift {
+                    if self.selection_anchor.is_none() {
+                        self.selection_anchor = Some(self.cursor_flat_offset());
+                    }
+                } else {
+                    self.selection_anchor = None;
+                }
+                self.editor_buffer.cursor_row = 0;
+                self.editor_buffer.cursor_col = 0;
+            }
+            KeyCode::End if ctrl => {
+                if shift {
+                    if self.selection_anchor.is_none() {
+                        self.selection_anchor = Some(self.cursor_flat_offset());
+                    }
+                } else {
+                    self.selection_anchor = None;
+                }
+                self.editor_buffer.set_cursor_to_end();
+            }
+            // PageUp/PageDown
+            KeyCode::PageDown => {
+                if shift {
+                    if self.selection_anchor.is_none() {
+                        self.selection_anchor = Some(self.cursor_flat_offset());
+                    }
+                } else {
+                    self.selection_anchor = None;
+                }
+                self.move_page_down();
+            }
+            KeyCode::PageUp => {
+                if shift {
+                    if self.selection_anchor.is_none() {
+                        self.selection_anchor = Some(self.cursor_flat_offset());
+                    }
+                } else {
+                    self.selection_anchor = None;
+                }
+                self.move_page_up();
+            }
             // Movement keys: Shift extends selection, bare movement clears it
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
             | KeyCode::Home | KeyCode::End => {
@@ -1111,6 +1341,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
+                self.push_undo();
                 self.delete_selection();
                 self.editor_buffer.insert_newline();
                 self.dirty = true;
@@ -1118,19 +1349,23 @@ impl App {
             }
             KeyCode::Tab => {
                 if self.selection_anchor.is_some() {
+                    self.push_undo();
                     self.delete_selection();
                     self.editor_buffer.insert_str("    ");
                     self.dirty = true;
                     self.last_edit = Some(Instant::now());
                 } else if let Some(idx) = self.lint_index_at_cursor() {
+                    self.push_undo();
                     self.apply_lint_fix(idx);
                 } else {
+                    self.push_undo();
                     self.editor_buffer.insert_str("    ");
                     self.dirty = true;
                     self.last_edit = Some(Instant::now());
                 }
             }
             KeyCode::Backspace => {
+                self.push_undo();
                 if !self.delete_selection() {
                     self.editor_buffer.backspace();
                     self.dirty = true;
@@ -1138,6 +1373,7 @@ impl App {
                 }
             }
             KeyCode::Delete => {
+                self.push_undo();
                 if !self.delete_selection() {
                     self.editor_buffer.delete();
                     self.dirty = true;
@@ -1148,6 +1384,7 @@ impl App {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
+                self.push_undo();
                 self.delete_selection();
                 self.editor_buffer.insert_char(c);
                 self.dirty = true;
@@ -1597,6 +1834,30 @@ impl App {
         }
     }
 
+    fn push_undo(&mut self) {
+        if self.undo_stack.last() != Some(&self.editor_buffer) {
+            self.undo_stack.push(self.editor_buffer.clone());
+            if self.undo_stack.len() > 200 {
+                self.undo_stack.remove(0);
+            }
+            self.redo_stack.clear();
+        }
+    }
+
+    fn move_page_down(&mut self) {
+        let n = self.editor_row_height.max(1);
+        for _ in 0..n {
+            self.move_visual_down();
+        }
+    }
+
+    fn move_page_up(&mut self) {
+        let n = self.editor_row_height.max(1);
+        for _ in 0..n {
+            self.move_visual_up();
+        }
+    }
+
     fn editor_view(&self, area: Rect, palette: Palette) -> (Text<'static>, u16, u16, u16) {
         if area.width == 0 || area.height == 0 {
             return (Text::default(), area.x, area.y, 0);
@@ -2039,6 +2300,7 @@ impl App {
             .split(editor_inner);
 
         self.editor_col_width = editor_layout[1].width as usize;
+        self.editor_row_height = editor_layout[1].height as usize;
 
         let meta = Paragraph::new(active_meta_line);
         frame.render_widget(meta, editor_layout[0]);
