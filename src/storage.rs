@@ -259,6 +259,16 @@ impl Store {
         self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
         Ok(())
     }
+
+    pub fn list_folders(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT folder FROM notes WHERE folder != '' AND archived = 0 ORDER BY folder"
+        )?;
+        let folders = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(folders)
+    }
 }
 
 fn resolve_data_dir() -> Result<std::path::PathBuf> {

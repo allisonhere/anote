@@ -55,6 +55,12 @@ enum Mode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Folders,
+    Notes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThemeName {
     NeoNoir,
     Paper,
@@ -511,6 +517,10 @@ pub struct App {
     notes_pane_collapsed: bool,
     preview_scroll: u16,
     help_scroll: u16,
+    focus: Focus,
+    folder_list: Vec<String>,   // distinct non-empty folder names
+    folder_cursor: usize,       // 0 = All Notes, 1+ = folder_list[i-1]
+    sidebar_folder: Option<String>,
 }
 
 impl App {
@@ -561,11 +571,26 @@ impl App {
             notes_pane_collapsed: false,
             preview_scroll: 0,
             help_scroll: 0,
+            focus: Focus::Notes,
+            folder_list: Vec::new(),
+            folder_cursor: 0,
+            sidebar_folder: None,
         };
         app.apply_editor_keymap();
         app.refresh_notes()?;
         app.load_selected()?;
         Ok(app)
+    }
+
+    /// Pre-select a note by ID before entering the TUI.
+    /// If `edit` is true, enters edit mode immediately.
+    pub fn open_note_id(&mut self, id: i64, edit: bool) -> Result<()> {
+        self.select_by_id(id);
+        self.load_selected()?;
+        if edit {
+            self.enter_edit_mode();
+        }
+        Ok(())
     }
 
     pub fn run(mut self) -> Result<()> {
@@ -860,6 +885,41 @@ impl App {
                 self.preview_scroll = self.preview_scroll.saturating_sub(20);
                 return Ok(false);
             }
+        }
+
+        // Tab: toggle focus between folder browser and notes list
+        if key.code == KeyCode::Tab {
+            self.focus = if self.focus == Focus::Folders {
+                Focus::Notes
+            } else {
+                Focus::Folders
+            };
+            return Ok(false);
+        }
+
+        // When folder pane is focused, j/k navigate folders
+        if self.focus == Focus::Folders {
+            if self.normal_is_down(&key) {
+                if self.folder_cursor < self.folder_list.len() {
+                    self.folder_cursor += 1;
+                }
+                self.apply_folder_cursor()?;
+                return Ok(false);
+            }
+            if self.normal_is_up(&key) {
+                if self.folder_cursor > 0 {
+                    self.folder_cursor -= 1;
+                }
+                self.apply_folder_cursor()?;
+                return Ok(false);
+            }
+            // Enter or vim 'l': move focus to notes pane
+            if matches!(key.code, KeyCode::Enter)
+                || (self.keymap == KeymapPreset::Vim && key.code == KeyCode::Char('l'))
+            {
+                self.focus = Focus::Notes;
+            }
+            return Ok(false);
         }
 
         if self.normal_is_down(&key) {
@@ -1641,8 +1701,40 @@ impl App {
         Ok(false)
     }
 
+    fn refresh_folders(&mut self) -> Result<()> {
+        self.folder_list = self.store.list_folders()?;
+        let max = self.folder_list.len();
+        if self.folder_cursor > max {
+            self.folder_cursor = max;
+        }
+        Ok(())
+    }
+
+    fn apply_folder_cursor(&mut self) -> Result<()> {
+        self.sidebar_folder = if self.folder_cursor == 0 {
+            None
+        } else {
+            Some(self.folder_list[self.folder_cursor - 1].clone())
+        };
+        self.refresh_notes()?;
+        self.selected = 0;
+        self.load_selected()?;
+        Ok(())
+    }
+
     fn refresh_notes(&mut self) -> Result<()> {
-        self.notes = match self.store.list_notes(&self.query) {
+        let effective_query = match &self.sidebar_folder {
+            Some(f) => {
+                let q = self.query.trim();
+                if q.is_empty() {
+                    format!("/{}", f)
+                } else {
+                    format!("{} /{}", q, f)
+                }
+            }
+            None => self.query.clone(),
+        };
+        self.notes = match self.store.list_notes(&effective_query) {
             Ok(n) => n,
             Err(e) => {
                 self.status = format!("Search error: {}", e);
@@ -1650,6 +1742,7 @@ impl App {
                 self.store.list_notes("")?
             }
         };
+        self.refresh_folders()?;
         if self.notes.is_empty() {
             self.selected = 0;
             self.active_note_id = None;
@@ -2417,6 +2510,56 @@ impl App {
             .constraints(split)
             .split(layout[1]);
 
+        // Split left pane: folder browser (top) + notes list (bottom)
+        let show_folder_pane = !self.notes_pane_collapsed
+            && !matches!(self.mode, Mode::Edit | Mode::Find);
+        let folder_pane_h: u16 = if show_folder_pane {
+            let items = self.folder_list.len() + 1; // +1 for "All Notes"
+            (items as u16 + 2).min(10) // +2 borders, cap at 10 rows
+        } else {
+            0
+        };
+        let left_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(folder_pane_h), Constraint::Min(1)])
+            .split(main[0]);
+        let folder_area = left_split[0];
+        let notes_area = left_split[1];
+
+        if show_folder_pane {
+            let folder_focused = self.focus == Focus::Folders;
+            let folder_items: Vec<ListItem> = std::iter::once("All Notes".to_string())
+                .chain(self.folder_list.iter().cloned())
+                .enumerate()
+                .map(|(i, name)| {
+                    let is_cursor = i == self.folder_cursor;
+                    let style = if is_cursor && folder_focused {
+                        Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD)
+                    } else if is_cursor {
+                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.text)
+                    };
+                    let label = if i == 0 {
+                        format!("  {}", name)
+                    } else {
+                        format!("  {}/", name)
+                    };
+                    ListItem::new(TSpan::styled(label, style))
+                })
+                .collect();
+
+            let folder_block = Block::default()
+                .title(" Folders ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(
+                    if folder_focused { palette.accent } else { palette.muted }
+                ))
+                .style(Style::default().bg(palette.bg));
+
+            frame.render_widget(List::new(folder_items).block(folder_block), folder_area);
+        }
+
         let list_items: Vec<ListItem> = if self.notes.is_empty() {
             vec![ListItem::new(Line::styled(
                 "No notes. Press 'n' to create one.",
@@ -2521,7 +2664,7 @@ impl App {
             .style(Style::default().bg(palette.panel).fg(palette.text))
             .border_style(Style::default().fg(list_border_color));
         if self.mode != Mode::Edit {
-            frame.render_widget(List::new(list_items).block(list_block), main[0]);
+            frame.render_widget(List::new(list_items).block(list_block), notes_area);
         }
 
         let meta_base = Style::default()
@@ -2758,8 +2901,14 @@ impl App {
             row("/",               "search notes"),
             row(":",               "command palette"),
             row("\\",              "toggle notes pane"),
+            row("Tab",             "focus folder browser"),
             row("q",               "quit"),
             row("#tag in body",    "add tag to note"),
+            pad(),
+            heading("  FOLDER BROWSER"),
+            row("j/k",             "navigate folders"),
+            row("Enter",           "select folder / focus notes"),
+            row("Tab",             "switch focus back to notes"),
             pad(),
             heading("  COLLAPSED PANE"),
             row("j/k  ↑↓",        "scroll preview"),
