@@ -135,19 +135,29 @@ clean_dist() {
 }
 
 build_all() {
+  local use_zigbuild=false
   local use_cross=false
+
+  if command -v cargo-zigbuild &>/dev/null; then
+    use_zigbuild=true
+    print_substep "Using 'cargo-zigbuild' for Linux targets (glibc ≥ 2.17)"
+  else
+    print_warning "'cargo-zigbuild' not found — Linux binaries will require host glibc version"
+    print_warning "  Install with: cargo install cargo-zigbuild && pip install ziglang"
+  fi
+
   if command -v cross &>/dev/null; then
     use_cross=true
-    print_substep "Using 'cross' for cross-compilation"
+    print_substep "Using 'cross' for macOS cross-compilation"
   else
-    print_warning "'cross' not found — building native targets only (install 'cross' for full cross-compilation)"
+    print_warning "'cross' not found — skipping macOS cross-compilation"
   fi
 
   local host_os host_arch
   host_os=$(uname -s | tr '[:upper:]' '[:lower:]')
   host_arch=$(uname -m)
 
-  # target triple | output name | can cross-compile without 'cross'
+  # target triple | output name | target OS | target arch
   local targets=(
     "x86_64-unknown-linux-gnu   anote-linux-x86_64   linux  x86_64"
     "aarch64-unknown-linux-gnu  anote-linux-aarch64  linux  aarch64"
@@ -164,10 +174,15 @@ build_all() {
       is_native=true
     fi
 
-    # Skip non-native targets when cross is unavailable and target OS differs
-    if [ "$use_cross" = false ] && [ "$is_native" = false ]; then
-      print_warning "Skipping $triple (need 'cross' for cross-compilation)"
-      continue
+    # Skip non-native targets when required tooling is unavailable
+    if [ "$is_native" = false ]; then
+      if [[ "$target_os" == "linux" ]] && [ "$use_zigbuild" = false ]; then
+        print_warning "Skipping $triple (need 'cargo-zigbuild' for Linux cross-compilation)"
+        continue
+      elif [[ "$target_os" != "linux" ]] && [ "$use_cross" = false ]; then
+        print_warning "Skipping $triple (need 'cross' for macOS cross-compilation)"
+        continue
+      fi
     fi
 
     # Ensure target is registered with rustup
@@ -176,7 +191,10 @@ build_all() {
     local bin_path="$PROJECT_DIR/target/$triple/release/$BINARY_NAME"
     local archive="$DIST_DIR/$name.tar.gz"
 
-    if [ "$use_cross" = true ] && [ "$is_native" = false ]; then
+    if [[ "$target_os" == "linux" ]] && [ "$use_zigbuild" = true ]; then
+      # Pin minimum glibc to 2.17 for broad distro compatibility
+      (cd "$PROJECT_DIR" && cargo zigbuild --release --target "${triple}.2.17" 2>&1) &
+    elif [ "$use_cross" = true ] && [ "$is_native" = false ]; then
       (cd "$PROJECT_DIR" && cross build --release --target "$triple" 2>&1) &
     else
       (cd "$PROJECT_DIR" && cargo build --release --target "$triple" 2>&1) &
@@ -319,10 +337,16 @@ show_status() {
     echo -e "  ${BOLD}Git:${NC}      ${GREEN}clean${NC}"
   fi
 
+  if command -v cargo-zigbuild &>/dev/null; then
+    echo -e "  ${BOLD}zigbuild:${NC} ${GREEN}available (glibc 2.17+)${NC}"
+  else
+    echo -e "  ${BOLD}zigbuild:${NC} ${YELLOW}not found (Linux binaries won't be glibc-pinned)${NC}"
+  fi
+
   if command -v cross &>/dev/null; then
     echo -e "  ${BOLD}cross:${NC}    ${GREEN}available${NC}"
   else
-    echo -e "  ${BOLD}cross:${NC}    ${YELLOW}not found (native only)${NC}"
+    echo -e "  ${BOLD}cross:${NC}    ${YELLOW}not found (skip macOS cross-compilation)${NC}"
   fi
   echo ""
 }
