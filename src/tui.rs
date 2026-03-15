@@ -505,6 +505,7 @@ pub struct App {
     find_matches: Vec<usize>, // flat char offsets of match starts
     find_cursor: usize,       // index into find_matches
     find_committed: bool,     // true = navigation phase; false = typing phase
+    pre_search_query: String, // query before entering search mode (for Esc restore)
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     notes_pane_collapsed: bool,
@@ -554,6 +555,7 @@ impl App {
             find_matches: Vec::new(),
             find_cursor: 0,
             find_committed: false,
+            pre_search_query: String::new(),
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             notes_pane_collapsed: false,
@@ -618,6 +620,7 @@ impl App {
                             self.editor_state.cursor.col = col;
                         }
                         self.last_edit = None;
+                        self.status = "Saved".to_string();
                     }
                 }
             }
@@ -786,8 +789,13 @@ impl App {
 
     fn enter_edit_mode(&mut self) {
         self.mode = Mode::Edit;
-        self.editor_state.cursor.row = self.editor_buffer.lines.len().saturating_sub(1);
-        self.editor_state.cursor.col = self.editor_buffer.current_line_len();
+        // Position cursor at preview scroll row (clamped to valid range)
+        let target_row = (self.preview_scroll as usize)
+            .min(self.editor_buffer.lines.len().saturating_sub(1));
+        self.editor_buffer.cursor_row = target_row;
+        self.editor_buffer.cursor_col = 0;
+        self.editor_state.cursor.row = target_row;
+        self.editor_state.cursor.col = 0;
         self.editor_state.mode = match self.keymap {
             KeymapPreset::Default => EditorMode::Insert,
             KeymapPreset::Vim => EditorMode::Normal,
@@ -844,32 +852,30 @@ impl App {
         }
 
         if self.notes_pane_collapsed {
-            if self.normal_is_down(&key) || key.code == KeyCode::PageDown {
-                let step: u16 = if key.code == KeyCode::PageDown { 20 } else { 1 };
-                self.preview_scroll = self.preview_scroll.saturating_add(step);
+            if key.code == KeyCode::PageDown {
+                self.preview_scroll = self.preview_scroll.saturating_add(20);
                 return Ok(false);
             }
-            if self.normal_is_up(&key) || key.code == KeyCode::PageUp {
-                let step: u16 = if key.code == KeyCode::PageUp { 20 } else { 1 };
-                self.preview_scroll = self.preview_scroll.saturating_sub(step);
+            if key.code == KeyCode::PageUp {
+                self.preview_scroll = self.preview_scroll.saturating_sub(20);
                 return Ok(false);
             }
-        } else {
-            if self.normal_is_down(&key) {
-                if self.selected + 1 < self.notes.len() {
-                    self.selected += 1;
-                    self.load_selected()?;
-                }
-                return Ok(false);
-            }
+        }
 
-            if self.normal_is_up(&key) {
-                if self.selected > 0 {
-                    self.selected -= 1;
-                    self.load_selected()?;
-                }
-                return Ok(false);
+        if self.normal_is_down(&key) {
+            if self.selected + 1 < self.notes.len() {
+                self.selected += 1;
+                self.load_selected()?;
             }
+            return Ok(false);
+        }
+
+        if self.normal_is_up(&key) {
+            if self.selected > 0 {
+                self.selected -= 1;
+                self.load_selected()?;
+            }
+            return Ok(false);
         }
 
         match key.code {
@@ -893,6 +899,7 @@ impl App {
             }
             KeyCode::Char('/') => {
                 self.mode = Mode::Search;
+                self.pre_search_query = self.query.clone();
                 self.search_input = self.query.clone();
                 self.status = "Search mode".to_string();
             }
@@ -932,8 +939,8 @@ impl App {
             return Ok(false);
         }
 
-        // Ctrl+F: find within note (default keymap only; vim uses edtui's / search)
-        if is_ctrl_char(&key, 'f') && self.keymap == KeymapPreset::Default {
+        // Ctrl+F: find within note (both keymaps)
+        if is_ctrl_char(&key, 'f') {
             self.find_query.clear();
             self.find_matches.clear();
             self.find_cursor = 0;
@@ -975,22 +982,24 @@ impl App {
             return Ok(false);
         }
 
-        // Lint jumps (both keymaps)
-        if key.code == KeyCode::Char(']') && self.lints_active {
-            self.selection_anchor = None;
-            if let Some(off) = self.next_lint_offset() {
-                self.jump_to_flat_offset(off);
-                self.sync_cursor_to_state();
+        // Lint jumps (default keymap only; vim uses ] and [ for other things)
+        if self.keymap == KeymapPreset::Default {
+            if key.code == KeyCode::Char(']') && self.lints_active {
+                self.selection_anchor = None;
+                if let Some(off) = self.next_lint_offset() {
+                    self.jump_to_flat_offset(off);
+                    self.sync_cursor_to_state();
+                }
+                return Ok(false);
             }
-            return Ok(false);
-        }
-        if key.code == KeyCode::Char('[') && self.lints_active {
-            self.selection_anchor = None;
-            if let Some(off) = self.prev_lint_offset() {
-                self.jump_to_flat_offset(off);
-                self.sync_cursor_to_state();
+            if key.code == KeyCode::Char('[') && self.lints_active {
+                self.selection_anchor = None;
+                if let Some(off) = self.prev_lint_offset() {
+                    self.jump_to_flat_offset(off);
+                    self.sync_cursor_to_state();
+                }
+                return Ok(false);
             }
-            return Ok(false);
         }
 
         match self.keymap {
@@ -1245,14 +1254,16 @@ impl App {
     fn handle_search_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc => {
+                // Restore the pre-search query
+                self.query = self.pre_search_query.clone();
+                self.refresh_notes()?;
+                self.selected = 0;
+                self.load_selected()?;
                 self.mode = Mode::Normal;
                 self.status = "Search canceled".to_string();
             }
             KeyCode::Enter => {
                 self.query = self.search_input.trim().to_string();
-                self.refresh_notes()?;
-                self.selected = 0;
-                self.load_selected()?;
                 self.mode = Mode::Normal;
                 self.status = if self.query.is_empty() {
                     "Search cleared  (#tag /folder text)".to_string()
@@ -1262,9 +1273,19 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.search_input.pop();
+                let q = self.search_input.trim().to_string();
+                self.query = q;
+                self.refresh_notes()?;
+                self.selected = 0;
+                self.load_selected()?;
             }
             KeyCode::Char(c) => {
                 self.search_input.push(c);
+                let q = self.search_input.trim().to_string();
+                self.query = q;
+                self.refresh_notes()?;
+                self.selected = 0;
+                self.load_selected()?;
             }
             _ => {}
         }
@@ -1586,10 +1607,31 @@ impl App {
                     self.status = "No active note".to_string();
                 }
             }
+            "rename" => {
+                let new_title = parts.collect::<Vec<_>>().join(" ");
+                if new_title.is_empty() {
+                    self.status = "Usage: :rename <new title>".to_string();
+                } else if self.active_note_id.is_some() {
+                    // Replace or prepend first line with the new title
+                    if self.editor_buffer.lines.is_empty() || self.editor_buffer.lines[0].is_empty() {
+                        if self.editor_buffer.lines.is_empty() {
+                            self.editor_buffer.lines.push(new_title.clone());
+                        } else {
+                            self.editor_buffer.lines[0] = new_title.clone();
+                        }
+                    } else {
+                        self.editor_buffer.lines[0] = new_title.clone();
+                    }
+                    self.sync_state_from_editor_buffer();
+                    self.dirty = true;
+                    self.save_active_note()?;
+                    self.status = format!("Renamed to: {}", new_title);
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
             "help" => {
-                self.status =
-                    "Commands: :new :edit :search <q> :folder :pin :unpin :archive :unarchive :theme :keymap :reload :quit"
-                        .to_string();
+                self.mode = Mode::Help;
             }
             _ => {
                 self.status = format!("Unknown command: {}", command);
@@ -2251,7 +2293,11 @@ impl App {
             })
             .collect();
 
-        let hint = "  Tab: apply";
+        let hint = if lint.suggestions.is_empty() {
+            "  (no fix available)"
+        } else {
+            "  Tab: apply"
+        };
 
         let mut max_len = message.len().max(hint.len());
         for s in &sugg_lines {
@@ -2595,16 +2641,14 @@ impl App {
         if self.mode == Mode::Edit {
             if let Some(idx) = self.lint_index_at_cursor() {
                 if let Some(lint) = self.lints.get(idx) {
-                    if !lint.suggestions.is_empty() {
-                        self.render_lint_popup(
-                            frame,
-                            editor_layout[1],
-                            cursor_x,
-                            cursor_y,
-                            lint,
-                            palette,
-                        );
-                    }
+                    self.render_lint_popup(
+                        frame,
+                        editor_layout[1],
+                        cursor_x,
+                        cursor_y,
+                        lint,
+                        palette,
+                    );
                 }
             }
         }
@@ -2641,6 +2685,7 @@ impl App {
                     lint_hint = lint_hint,
                 )
             }
+            Mode::Help => "  j/k scroll  Esc/? close".to_string(),
             _ => {
                 format!(
                     "[{mode}] {status} {dirty} | : command  n new  d delete  \\ pane | F6 theme | F7 keymap | ? help | q quit",
@@ -2656,6 +2701,8 @@ impl App {
                 .bg(palette.panel)
                 .fg(if self.mode == Mode::Command {
                     palette.accent
+                } else if self.delete_pending {
+                    palette.danger
                 } else if self.dirty {
                     palette.danger
                 } else {
@@ -2712,6 +2759,7 @@ impl App {
             row(":",               "command palette"),
             row("\\",              "toggle notes pane"),
             row("q",               "quit"),
+            row("#tag in body",    "add tag to note"),
             pad(),
             heading("  COLLAPSED PANE"),
             row("j/k  ↑↓",        "scroll preview"),
@@ -2741,6 +2789,7 @@ impl App {
             pad(),
             heading("  SEARCH  (/)"),
             row("#tag",            "filter by tag"),
+            row("#tag in body",    "adds searchable tag"),
             row("/folder",         "filter by folder"),
             row(":archived",       "show archived"),
             pad(),
