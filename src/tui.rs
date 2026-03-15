@@ -2336,10 +2336,9 @@ impl App {
         let top_text = Text::from(Line::from(vec![
             TSpan::styled(
                 format!(
-                    " anote  theme:{}  keymap:{}  density:{}  notes:{}  {}",
+                    " anote  theme:{}  keymap:{}  notes:{}  {}",
                     self.theme.label(),
                     self.keymap.label(),
-                    self.density.label(),
                     self.notes.len(),
                     query_tag
                 ),
@@ -2430,23 +2429,6 @@ impl App {
                     };
                     spans.push(title_sp);
 
-                    if !n.tags.is_empty() {
-                        let pill_colors = self.theme.tag_pill_colors();
-                        for tag in n.tags.split_whitespace().take(3) {
-                            // gap before each pill (blends with row bg)
-                            spans.push(if selected_row {
-                                TSpan::styled(" ", Style::default().bg(palette.accent).fg(palette.bg))
-                            } else {
-                                TSpan::styled(" ", Style::default())
-                            });
-                            // pill — distinct color per tag, same on selected/unselected
-                            spans.push(TSpan::styled(
-                                format!(" #{} ", tag),
-                                pill_style_for_tag(tag, pill_colors),
-                            ));
-                        }
-                    }
-
                     let ts_text = format!("  {}", ts);
                     let ts_sp = if selected_row {
                         TSpan::styled(
@@ -2461,7 +2443,22 @@ impl App {
                     };
                     spans.push(ts_sp);
 
-                    ListItem::new(Line::from(spans))
+                    let title_line = Line::from(spans);
+
+                    if !n.tags.is_empty() {
+                        let pill_colors = self.theme.tag_pill_colors();
+                        let mut tag_spans: Vec<TSpan<'static>> = vec![TSpan::raw("  ")];
+                        for tag in n.tags.split_whitespace() {
+                            tag_spans.push(TSpan::styled(
+                                format!(" #{} ", tag),
+                                pill_style_for_tag(tag, pill_colors),
+                            ));
+                            tag_spans.push(TSpan::raw(" "));
+                        }
+                        ListItem::new(Text::from(vec![title_line, Line::from(tag_spans)]))
+                    } else {
+                        ListItem::new(Text::from(vec![title_line]))
+                    }
                 })
                 .collect()
         };
@@ -2496,17 +2493,6 @@ impl App {
                     format!("  folder:{}", summary.folder),
                     meta_base,
                 ));
-            }
-            if !summary.tags.is_empty() {
-                spans.push(TSpan::styled("  ", meta_base));
-                let pill_colors = self.theme.tag_pill_colors();
-                for tag in summary.tags.split_whitespace() {
-                    spans.push(TSpan::styled(
-                        format!(" #{} ", tag),
-                        pill_style_for_tag(tag, pill_colors),
-                    ));
-                    spans.push(TSpan::styled(" ", meta_base));
-                }
             }
             Line::from(spans)
         } else {
