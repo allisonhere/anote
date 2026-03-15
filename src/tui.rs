@@ -16,6 +16,7 @@ use edtui::{
     actions::{Execute, InsertChar},
 };
 use ratatui::{
+    widgets::Wrap,
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -26,8 +27,8 @@ use ratatui::{
 
 use harper_core::linting::{LintGroup, Linter};
 use pulldown_cmark::{
-    Event as MdEvent, HeadingLevel, Options as MdOptions, Parser as MdParser, Tag as MdTag,
-    TagEnd as MdTagEnd,
+    CodeBlockKind, Event as MdEvent, HeadingLevel, Options as MdOptions, Parser as MdParser,
+    Tag as MdTag, TagEnd as MdTagEnd,
 };
 use harper_core::parsers::PlainEnglish;
 use harper_core::spell::FstDictionary;
@@ -1969,11 +1970,13 @@ impl App {
                 // Check for opening fence
                 if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
                     let fence_char = if trimmed.starts_with("```") { "```" } else { "~~~" };
-                    let lang = trimmed.trim_start_matches(fence_char).trim();
+                    let lang = trimmed.trim_start_matches(fence_char).trim().trim_end_matches('`').trim();
                     let syntax = if lang.is_empty() {
                         self.syntax_set.find_syntax_plain_text()
                     } else {
+                        let lower = lang.to_lowercase();
                         self.syntax_set.find_syntax_by_token(lang)
+                            .or_else(|| self.syntax_set.syntaxes().iter().find(|s| s.name.to_lowercase() == lower))
                             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
                     };
                     highlighter = Some(HighlightLines::new(syntax, theme));
@@ -2589,9 +2592,12 @@ impl App {
                 &self.editor_buffer.to_text(),
                 palette,
                 editor_layout[1].width as usize,
+                &self.syntax_set,
+                &self.theme_set,
             );
             let preview = Paragraph::new(md_text)
                 .style(Style::default().fg(palette.text).bg(palette.panel))
+                .wrap(Wrap { trim: false })
                 .scroll((self.preview_scroll, 0));
             frame.render_widget(preview, editor_layout[1]);
         }
@@ -3043,9 +3049,30 @@ fn build_spans_for_row(
     spans
 }
 
-fn render_markdown_preview(text: &str, palette: Palette, _width: usize) -> Text<'static> {
+fn fix_fences(text: &str) -> String {
+    // CommonMark disallows backticks in a backtick-fence info string.
+    // When the user writes ```lang``` (open+close on one line), strip the
+    // trailing fence so pulldown-cmark sees a valid opening fence.
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim_end();
+            for fence in &["```", "~~~"] {
+                if trimmed.starts_with(fence) && trimmed.ends_with(fence)
+                    && trimmed.len() > fence.len() * 2
+                {
+                    let stripped = &trimmed[..trimmed.len() - fence.len()];
+                    return format!("{}\n", stripped);
+                }
+            }
+            format!("{}\n", line)
+        })
+        .collect()
+}
+
+fn render_markdown_preview(text: &str, palette: Palette, _width: usize, syntax_set: &SyntaxSet, theme_set: &ThemeSet) -> Text<'static> {
+    let fixed = fix_fences(text);
     let opts = MdOptions::ENABLE_STRIKETHROUGH | MdOptions::ENABLE_TABLES;
-    let parser = MdParser::new_ext(text, opts);
+    let parser = MdParser::new_ext(&fixed, opts);
 
     let heading_style = Style::default()
         .fg(palette.accent)
@@ -3061,11 +3088,15 @@ fn render_markdown_preview(text: &str, palette: Palette, _width: usize) -> Text<
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut current_spans: Vec<TSpan<'static>> = Vec::new();
+    let preview_theme = theme_set.themes.get("base16-ocean.dark")
+        .or_else(|| theme_set.themes.values().next());
+
     let mut in_heading: Option<HeadingLevel> = None;
     let mut in_bold = false;
     let mut in_italic = false;
     let in_code = false;
     let mut in_code_block = false;
+    let mut code_highlighter: Option<HighlightLines> = None;
     let mut list_depth: usize = 0;
     let mut is_list_item = false;
     let mut list_item_first = false;
@@ -3092,12 +3123,23 @@ fn render_markdown_preview(text: &str, palette: Palette, _width: usize) -> Text<
             MdEvent::End(MdTagEnd::Strong) => in_bold = false,
             MdEvent::Start(MdTag::Emphasis) => in_italic = true,
             MdEvent::End(MdTagEnd::Emphasis) => in_italic = false,
-            MdEvent::Start(MdTag::CodeBlock(_)) => {
+            MdEvent::Start(MdTag::CodeBlock(kind)) => {
                 in_code_block = true;
                 lines.push(Line::from(vec![]));
+                if let (CodeBlockKind::Fenced(lang_cow), Some(theme)) = (&kind, preview_theme) {
+                    let lang = lang_cow.trim().trim_end_matches('`').trim();
+                    if !lang.is_empty() {
+                        let lower = lang.to_lowercase();
+                        let syntax = syntax_set.find_syntax_by_token(lang)
+                            .or_else(|| syntax_set.syntaxes().iter().find(|s| s.name.to_lowercase() == lower))
+                            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+                        code_highlighter = Some(HighlightLines::new(syntax, theme));
+                    }
+                }
             }
             MdEvent::End(MdTagEnd::CodeBlock) => {
                 in_code_block = false;
+                code_highlighter = None;
                 lines.push(Line::from(vec![]));
             }
             MdEvent::Code(s) => {
@@ -3151,14 +3193,28 @@ fn render_markdown_preview(text: &str, palette: Palette, _width: usize) -> Text<
                 };
 
                 if in_code_block {
-                    // Emit each line of the code block separately
+                    // Emit each line of the code block separately, with syntect highlighting if available
                     let lines_vec: Vec<&str> = s.lines().collect();
                     for (i, line) in lines_vec.iter().enumerate() {
                         let indent = "  ".repeat(list_depth.max(1).saturating_sub(1) + 1);
-                        current_spans.push(TSpan::styled(
-                            format!("{}{}", indent, line),
-                            style,
-                        ));
+                        if let Some(hl) = code_highlighter.as_mut() {
+                            let line_with_newline = format!("{}\n", line);
+                            if let Ok(tokens) = hl.highlight_line(&line_with_newline, syntax_set) {
+                                current_spans.push(TSpan::raw(indent));
+                                for (syntect_style, token_str) in &tokens {
+                                    let text = token_str.trim_end_matches('\n');
+                                    if !text.is_empty() {
+                                        let fg = syntect_style.foreground;
+                                        let span_style = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
+                                        current_spans.push(TSpan::styled(text.to_string(), span_style));
+                                    }
+                                }
+                            } else {
+                                current_spans.push(TSpan::styled(format!("{}{}", indent, line), code_style));
+                            }
+                        } else {
+                            current_spans.push(TSpan::styled(format!("{}{}", indent, line), code_style));
+                        }
                         if i + 1 < lines_vec.len() {
                             flush_line(&mut current_spans, &mut lines);
                         }
