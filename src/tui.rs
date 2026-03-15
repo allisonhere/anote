@@ -508,6 +508,7 @@ pub struct App {
     theme_set: ThemeSet,
     notes_pane_collapsed: bool,
     preview_scroll: u16,
+    help_scroll: u16,
 }
 
 impl App {
@@ -556,6 +557,7 @@ impl App {
             theme_set: ThemeSet::load_defaults(),
             notes_pane_collapsed: false,
             preview_scroll: 0,
+            help_scroll: 0,
         };
         app.apply_editor_keymap();
         app.refresh_notes()?;
@@ -686,8 +688,24 @@ impl App {
             Mode::Command => self.handle_command_key(key),
             Mode::Find => self.handle_find_key(key),
             Mode::Help => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
-                    self.mode = Mode::Normal;
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                        self.mode = Mode::Normal;
+                        self.help_scroll = 0;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.help_scroll = self.help_scroll.saturating_add(1);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.help_scroll = self.help_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown => {
+                        self.help_scroll = self.help_scroll.saturating_add(10);
+                    }
+                    KeyCode::PageUp => {
+                        self.help_scroll = self.help_scroll.saturating_sub(10);
+                    }
+                    _ => {}
                 }
                 Ok(false)
             }
@@ -2658,17 +2676,23 @@ impl App {
         if self.mode == Mode::Help {
             self.render_help_overlay(frame, palette);
         }
+
     }
 
-    fn render_help_overlay(&self, frame: &mut Frame, palette: Palette) {
+    fn render_help_overlay(&mut self, frame: &mut Frame, palette: Palette) {
         let area = frame.area();
-        let w = area.width.min(72);
-        let h = area.height.min(46);
+        let w = area.width.min(52);
+        let h = area.height.min(50);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = area.y + (area.height.saturating_sub(h)) / 2;
         let popup = Rect { x, y, width: w, height: h };
 
         frame.render_widget(Clear, popup);
+
+        // Inner usable width (minus border)
+        let inner_w = (w.saturating_sub(2)) as usize;
+        let kw = 16usize; // key column width
+        let dw = inner_w.saturating_sub(kw + 2); // description width
 
         let bold = |s: &str| TSpan::styled(s.to_string(), Style::default().add_modifier(Modifier::BOLD));
         let dim  = |s: &str| TSpan::styled(s.to_string(), Style::default().fg(palette.muted));
@@ -2677,66 +2701,69 @@ impl App {
 
         let pad = || Line::raw("");
 
-        let heading = |label: &str| {
-            Line::from(vec![bold(label)])
-        };
+        let heading = |label: &str| Line::from(vec![bold(label)]);
 
-        let row2 = |k1: &str, d1: &str, k2: &str, d2: &str| {
-            Line::from(vec![
-                key(&format!("  {:<20}", k1)),
-                txt(&format!("{:<22}", d1)),
-                key(&format!("  {:<16}", k2)),
-                txt(d2),
-            ])
-        };
-
-        let row1 = |k: &str, d: &str| {
-            Line::from(vec![key(&format!("  {:<20}", k)), txt(d)])
+        let row = |k: &str, d: &str| {
+            let k_str = format!("  {:<kw$}", k, kw = kw);
+            let d_str = format!("{:.dw$}", d, dw = dw);
+            Line::from(vec![key(&k_str), txt(&d_str)])
         };
 
         let lines: Vec<Line> = vec![
             pad(),
             heading("  NORMAL MODE"),
-            row2("j / k  ↑↓",    "navigate notes",      "n",       "new note"),
-            row2("Enter / e",     "open note",           "d d",     "delete note"),
-            row2("/",             "search notes",        ":",       "command"),
-            row2("\\",            "toggle notes pane",   "q",       "quit"),
+            row("j/k  ↑↓",        "navigate notes"),
+            row("Enter / e",       "open note"),
+            row("n",               "new note"),
+            row("d d",             "delete note"),
+            row("/",               "search notes"),
+            row(":",               "command palette"),
+            row("\\",              "toggle notes pane"),
+            row("q",               "quit"),
             pad(),
-            heading("  COLLAPSED PANE  (preview only)"),
-            row2("j / k  ↑↓",    "scroll one line",     "PgDn / PgUp", "scroll fast"),
+            heading("  COLLAPSED PANE"),
+            row("j/k  ↑↓",        "scroll preview"),
+            row("PgDn / PgUp",     "scroll fast"),
             pad(),
             heading("  EDIT MODE"),
-            row2("Esc",          "exit to preview",     "Ctrl+S",  "save"),
-            row2("Ctrl+F",       "find in note",        "Ctrl+L",  "spell / grammar lint"),
-            row2("Tab",          "apply lint fix",      "] / [",   "next / prev lint"),
-            row2("Ctrl+Z / Y",   "undo / redo",         "Ctrl+C/X","copy / cut"),
-            row1("Ctrl+V",       "paste from clipboard"),
+            row("Esc",             "exit to preview"),
+            row("Ctrl+S",          "save"),
+            row("Ctrl+Z / Y",      "undo / redo"),
+            row("Ctrl+C / X",      "copy / cut"),
+            row("Ctrl+V",          "paste"),
+            row("Ctrl+L",          "spell/grammar lint"),
+            row("Tab",             "apply lint fix"),
+            row("] / [",           "next / prev lint"),
             pad(),
-            Line::from(vec![bold("  DEFAULT  "), dim("(default keymap only)")]),
-            row2("Ctrl+F",       "find in note",        "Ctrl+A",  "select all"),
+            Line::from(vec![bold("  DEFAULT "), dim("(default keymap)")]),
+            row("Ctrl+F",          "find in note"),
+            row("Ctrl+A",          "select all"),
             pad(),
-            Line::from(vec![bold("  VIM  "), dim("(vim keymap only)")]),
-            row2("h j k l",      "move cursor",         "i / a",   "enter insert mode"),
-            row2("v",            "visual select",       "y / d",   "yank / delete"),
-            row2("p / P",        "paste (clipboard)",   "u / Ctrl+R","undo / redo"),
+            Line::from(vec![bold("  VIM "), dim("(vim keymap)")]),
+            row("h j k l",         "move cursor"),
+            row("i / a",           "insert mode"),
+            row("v",               "visual select"),
+            row("y / d",           "yank / delete"),
+            row("p / P",           "paste (clipboard)"),
+            row("u / Ctrl+R",      "undo / redo"),
             pad(),
-            heading("  SEARCH  (/ to enter)"),
-            row2("#tag",         "filter by tag",       "/folder", "filter by folder"),
-            row1(":archived",    "show archived notes"),
+            heading("  SEARCH  (/)"),
+            row("#tag",            "filter by tag"),
+            row("/folder",         "filter by folder"),
+            row(":archived",       "show archived"),
             pad(),
-            heading("  COMMANDS  (: to enter)"),
-            row2(":new",         "create a new note",            ":edit",      "open note in editor"),
-            row2(":folder <name>","move note to folder",          ":pin/:unpin","pin note to top"),
-            row2(":archive",     "hide note from main list",     ":unarchive", "restore archived note"),
-            row2(":search <q>",  "search programmatically",      ":reload",    "refresh note list"),
-            row2(":theme <name>","neo-noir | paper | matrix",    ":keymap",    "default | vim"),
+            heading("  COMMANDS  (:)"),
+            row(":new",            "create note"),
+            row(":folder <name>",  "move to folder"),
+            row(":pin / :unpin",   "pin to top"),
+            row(":archive",        "hide from list"),
+            row(":unarchive",      "restore archived"),
+            row(":search <q>",     "search"),
+            row(":theme <name>",   "neo-noir|paper|matrix"),
+            row(":keymap <name>",  "default|vim"),
+            row(":reload",         "refresh list"),
             pad(),
-            Line::from(vec![
-                dim("  F6 cycle theme   F7 cycle keymap"),
-                txt("                    "),
-                key("? or Esc"),
-                dim(" to close"),
-            ]),
+            Line::from(vec![dim("  F6 theme  F7 keymap  "), key("?/Esc"), dim(" close")]),
             pad(),
         ];
 
@@ -2749,8 +2776,14 @@ impl App {
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
 
+        let total = lines.len() as u16;
+        let visible = inner.height;
+        let max_scroll = total.saturating_sub(visible);
+        self.help_scroll = self.help_scroll.min(max_scroll);
+
         let para = Paragraph::new(lines)
-            .style(Style::default().bg(palette.bg).fg(palette.text));
+            .style(Style::default().bg(palette.bg).fg(palette.text))
+            .scroll((self.help_scroll, 0));
         frame.render_widget(para, inner);
     }
 }
