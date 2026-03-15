@@ -11,6 +11,14 @@ pub struct NoteSummary {
     pub tags: String,
     pub pinned: bool,
     pub archived: bool,
+    pub note_order: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FolderEntry {
+    pub id: i64,
+    pub name: String,
+    pub sort_order: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -73,10 +81,10 @@ impl Store {
         )?;
 
         // Migrations: add folder and tags columns to existing DBs.
-        // Suppress "duplicate column name" errors so this is safe on both fresh and existing DBs.
         for sql in &[
             "ALTER TABLE notes ADD COLUMN folder TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE notes ADD COLUMN tags   TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE notes ADD COLUMN note_order INTEGER NOT NULL DEFAULT 0",
         ] {
             match self.conn.execute_batch(sql) {
                 Ok(_) => {}
@@ -84,6 +92,24 @@ impl Store {
                 Err(e) => return Err(e.into()),
             }
         }
+
+        // Create folders table
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            );"
+        )?;
+
+        // Seed folders table from existing notes
+        self.conn.execute_batch(
+            "INSERT OR IGNORE INTO folders (name, sort_order)
+             SELECT folder, ROW_NUMBER() OVER (ORDER BY folder) * 10
+             FROM notes
+             WHERE folder != ''
+             GROUP BY folder;"
+        )?;
 
         Ok(())
     }
@@ -100,7 +126,6 @@ impl Store {
         };
 
         if fts.is_empty() {
-            // No FTS — scan notes table directly
             let mut where_clauses: Vec<String> = vec![archive_clause];
             let mut bind_vals: Vec<String> = Vec::new();
 
@@ -115,7 +140,7 @@ impl Store {
             }
 
             let sql = format!(
-                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived \
+                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived, n.note_order \
                  FROM notes n \
                  WHERE {} \
                  ORDER BY n.pinned DESC, n.updated_at DESC LIMIT 500",
@@ -134,6 +159,7 @@ impl Store {
                         tags: row.get(4)?,
                         pinned: row.get::<_, i64>(5)? != 0,
                         archived: row.get::<_, i64>(6)? != 0,
+                        note_order: row.get(7)?,
                     })
                 },
             )?;
@@ -141,7 +167,6 @@ impl Store {
                 notes.push(row?);
             }
         } else {
-            // FTS query
             let mut where_clauses: Vec<String> =
                 vec!["notes_fts MATCH ?".to_string(), archive_clause];
             let mut bind_vals: Vec<String> = vec![fts.clone()];
@@ -157,7 +182,7 @@ impl Store {
             }
 
             let sql = format!(
-                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived \
+                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived, n.note_order \
                  FROM notes_fts f \
                  JOIN notes n ON n.id = f.rowid \
                  WHERE {} \
@@ -177,6 +202,7 @@ impl Store {
                         tags: row.get(4)?,
                         pinned: row.get::<_, i64>(5)? != 0,
                         archived: row.get::<_, i64>(6)? != 0,
+                        note_order: row.get(7)?,
                     })
                 },
             )?;
@@ -186,6 +212,102 @@ impl Store {
         }
 
         Ok(notes)
+    }
+
+    pub fn list_notes_in_folder(&self, folder: &str, query: &str) -> Result<Vec<NoteSummary>> {
+        let (_tags, _folder_filter, show_archived, _fts) = parse_query(query);
+        let archive_clause = if show_archived { "n.archived = 1" } else { "n.archived = 0" };
+        let bind_folder = folder != "\x00ALL\x00";
+
+        let sql = format!(
+            "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived, n.note_order \
+             FROM notes n \
+             WHERE {} AND {} \
+             ORDER BY n.pinned DESC, n.note_order ASC, n.updated_at DESC LIMIT 500",
+            if bind_folder { "n.folder = ?" } else { "1=1" },
+            archive_clause
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut notes = Vec::new();
+        let map_row = |row: &rusqlite::Row<'_>| Ok(NoteSummary {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            updated_at: row.get(2)?,
+            folder: row.get(3)?,
+            tags: row.get(4)?,
+            pinned: row.get::<_, i64>(5)? != 0,
+            archived: row.get::<_, i64>(6)? != 0,
+            note_order: row.get(7)?,
+        });
+        if bind_folder {
+            for row in stmt.query_map(params![folder], map_row)? { notes.push(row?); }
+        } else {
+            for row in stmt.query_map([], map_row)? { notes.push(row?); }
+        }
+        Ok(notes)
+    }
+
+    pub fn list_folders(&self) -> Result<Vec<FolderEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, sort_order FROM folders ORDER BY sort_order, name"
+        )?;
+        let folders = stmt.query_map([], |row| {
+            Ok(FolderEntry { id: row.get(0)?, name: row.get(1)?, sort_order: row.get(2)? })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(folders)
+    }
+
+    pub fn create_folder(&self, name: &str) -> Result<i64> {
+        let max_order: i64 = self.conn
+            .query_row("SELECT COALESCE(MAX(sort_order), 0) FROM folders", [], |r| r.get(0))
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT OR IGNORE INTO folders (name, sort_order) VALUES (?1, ?2)",
+            params![name.trim(), max_order + 10],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn rename_folder(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.conn.execute("UPDATE folders SET name = ?1 WHERE name = ?2", params![new_name.trim(), old_name])?;
+        self.conn.execute("UPDATE notes SET folder = ?1 WHERE folder = ?2", params![new_name.trim(), old_name])?;
+        Ok(())
+    }
+
+    pub fn delete_folder(&self, name: &str) -> Result<()> {
+        self.conn.execute("UPDATE notes SET folder = '' WHERE folder = ?1", params![name])?;
+        self.conn.execute("DELETE FROM folders WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    pub fn swap_folder_order(&self, name_a: &str, name_b: &str) -> Result<()> {
+        let order_a: i64 = self.conn.query_row(
+            "SELECT sort_order FROM folders WHERE name = ?1", params![name_a], |r| r.get(0)
+        )?;
+        let order_b: i64 = self.conn.query_row(
+            "SELECT sort_order FROM folders WHERE name = ?1", params![name_b], |r| r.get(0)
+        )?;
+        self.conn.execute("UPDATE folders SET sort_order = ?1 WHERE name = ?2", params![order_b, name_a])?;
+        self.conn.execute("UPDATE folders SET sort_order = ?1 WHERE name = ?2", params![order_a, name_b])?;
+        Ok(())
+    }
+
+    pub fn swap_note_order(&self, id_a: i64, id_b: i64) -> Result<()> {
+        let order_a: i64 = self.conn.query_row(
+            "SELECT note_order FROM notes WHERE id = ?1", params![id_a], |r| r.get(0)
+        )?;
+        let order_b: i64 = self.conn.query_row(
+            "SELECT note_order FROM notes WHERE id = ?1", params![id_b], |r| r.get(0)
+        )?;
+        self.conn.execute("UPDATE notes SET note_order = ?1 WHERE id = ?2", params![order_b, id_a])?;
+        self.conn.execute("UPDATE notes SET note_order = ?1 WHERE id = ?2", params![order_a, id_b])?;
+        Ok(())
+    }
+
+    pub fn set_note_order(&self, id: i64, order: i64) -> Result<()> {
+        self.conn.execute("UPDATE notes SET note_order = ?1 WHERE id = ?2", params![order, id])?;
+        Ok(())
     }
 
     pub fn get_note(&self, id: i64) -> Result<Option<Note>> {
@@ -259,16 +381,6 @@ impl Store {
         self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
         Ok(())
     }
-
-    pub fn list_folders(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT folder FROM notes WHERE folder != '' AND archived = 0 ORDER BY folder"
-        )?;
-        let folders = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<String>, _>>()?;
-        Ok(folders)
-    }
 }
 
 fn resolve_data_dir() -> Result<std::path::PathBuf> {
@@ -333,10 +445,6 @@ fn extract_tags(body: &str) -> String {
 }
 
 /// Parse a search query into (tags, folder, show_archived, fts_text).
-/// Tokens starting with '#' → tag filter (lowercased, no '#').
-/// Tokens starting with '/' → folder filter (lowercased, no '/'; last one wins).
-/// Token `:archived` → show archived notes instead of active ones.
-/// Everything else → FTS text (rejoined).
 fn parse_query(query: &str) -> (Vec<String>, Option<String>, bool, String) {
     let mut tags: Vec<String> = Vec::new();
     let mut folder: Option<String> = None;

@@ -52,13 +52,35 @@ enum Mode {
     Command,
     Find,
     Help,
-    FolderPick,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Folders,
-    Notes,
+#[derive(Debug, Clone)]
+enum TreeItem {
+    Folder {
+        name: String,
+        expanded: bool,
+        note_count: usize,
+    },
+    Note(NoteSummary),
+}
+
+impl TreeItem {
+    fn is_folder(&self) -> bool { matches!(self, TreeItem::Folder { .. }) }
+    fn is_note(&self) -> bool { matches!(self, TreeItem::Note(_)) }
+    fn note(&self) -> Option<&NoteSummary> {
+        match self { TreeItem::Note(n) => Some(n), _ => None }
+    }
+    fn folder_name(&self) -> Option<&str> {
+        match self { TreeItem::Folder { name, .. } => Some(name), _ => None }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeInlineMode {
+    None,
+    CreateFolder,
+    RenameFolder(String),
+    RenameNote(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +429,11 @@ impl EditorBuffer {
         self.cursor_col = col;
     }
 
+    fn open_line_above(&mut self) {
+        self.lines.insert(self.cursor_row, String::new());
+        self.cursor_col = 0;
+    }
+
     fn move_word_right(&mut self) {
         let line_len = self.current_line_len();
         if self.cursor_col >= line_len {
@@ -480,8 +507,11 @@ fn is_ctrl_char(key: &KeyEvent, c: char) -> bool {
 
 pub struct App {
     store: Store,
-    notes: Vec<NoteSummary>,
-    selected: usize,
+    tree: Vec<TreeItem>,
+    tree_cursor: usize,
+    tree_expanded: std::collections::HashSet<String>,
+    tree_inline_input: String,
+    tree_inline_mode: TreeInlineMode,
     active_note_id: Option<i64>,
     editor_buffer: EditorBuffer,
     editor_state: EdtuiState,
@@ -509,22 +539,15 @@ pub struct App {
     undo_stack: Vec<EditorBuffer>,
     redo_stack: Vec<EditorBuffer>,
     find_query: String,
-    find_matches: Vec<usize>, // flat char offsets of match starts
-    find_cursor: usize,       // index into find_matches
-    find_committed: bool,     // true = navigation phase; false = typing phase
-    pre_search_query: String, // query before entering search mode (for Esc restore)
+    find_matches: Vec<usize>,
+    find_cursor: usize,
+    find_committed: bool,
+    pre_search_query: String,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     notes_pane_collapsed: bool,
     preview_scroll: u16,
     help_scroll: u16,
-    focus: Focus,
-    folder_list: Vec<String>,   // distinct non-empty folder names
-    folder_cursor: usize,       // 0 = All Notes, 1+ = folder_list[i-1]
-    sidebar_folder: Option<String>,
-    folder_pick_cursor: usize,
-    folder_pick_input: String,
-    folder_pick_typing: bool,
 }
 
 impl App {
@@ -533,8 +556,11 @@ impl App {
 
         let mut app = Self {
             store,
-            notes: Vec::new(),
-            selected: 0,
+            tree: Vec::new(),
+            tree_cursor: 0,
+            tree_expanded: std::collections::HashSet::new(),
+            tree_inline_input: String::new(),
+            tree_inline_mode: TreeInlineMode::None,
             active_note_id: None,
             editor_buffer: EditorBuffer::new(),
             editor_state: EdtuiState::new(Lines::from("")),
@@ -575,17 +601,9 @@ impl App {
             notes_pane_collapsed: false,
             preview_scroll: 0,
             help_scroll: 0,
-            focus: Focus::Notes,
-            folder_list: Vec::new(),
-            folder_cursor: 0,
-            sidebar_folder: None,
-            folder_pick_cursor: 0,
-            folder_pick_input: String::new(),
-            folder_pick_typing: false,
         };
         app.apply_editor_keymap();
         app.refresh_notes()?;
-        app.load_selected()?;
         Ok(app)
     }
 
@@ -593,7 +611,7 @@ impl App {
     /// If `edit` is true, enters edit mode immediately.
     pub fn open_note_id(&mut self, id: i64, edit: bool) -> Result<()> {
         self.select_by_id(id);
-        self.load_selected()?;
+        self.sync_active_note_from_cursor()?;
         if edit {
             self.enter_edit_mode();
         }
@@ -723,7 +741,6 @@ impl App {
             Mode::Search => self.handle_search_key(key),
             Mode::Command => self.handle_command_key(key),
             Mode::Find => self.handle_find_key(key),
-            Mode::FolderPick => self.handle_folder_pick_key(key),
             Mode::Help => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -842,7 +859,7 @@ impl App {
     }
 
     fn active_summary(&self) -> Option<&NoteSummary> {
-        self.notes.get(self.selected)
+        self.tree.get(self.tree_cursor).and_then(|item| item.note())
     }
 
     fn normal_is_down(&self, key: &KeyEvent) -> bool {
@@ -862,6 +879,25 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
+        // Handle inline tree input (folder create/rename/note rename)
+        if self.tree_inline_mode != TreeInlineMode::None {
+            match key.code {
+                KeyCode::Esc => {
+                    self.tree_inline_mode = TreeInlineMode::None;
+                    self.tree_inline_input.clear();
+                }
+                KeyCode::Enter => {
+                    self.commit_tree_inline()?;
+                }
+                KeyCode::Backspace => { self.tree_inline_input.pop(); }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.tree_inline_input.push(c);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if key.code == KeyCode::Char('?') {
             self.mode = Mode::Help;
             return Ok(false);
@@ -895,58 +931,48 @@ impl App {
             }
         }
 
-        // Tab: toggle focus between folder browser and notes list
-        if key.code == KeyCode::Tab {
-            self.focus = if self.focus == Focus::Folders {
-                Focus::Notes
-            } else {
-                Focus::Folders
-            };
-            return Ok(false);
-        }
-
-        // When folder pane is focused, j/k navigate folders
-        if self.focus == Focus::Folders {
-            if self.normal_is_down(&key) {
-                if self.folder_cursor < self.folder_list.len() {
-                    self.folder_cursor += 1;
+        // Shift+Up/Down: move item in tree
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            match key.code {
+                KeyCode::Up => {
+                    self.tree_shift_move(-1)?;
+                    return Ok(false);
                 }
-                self.apply_folder_cursor()?;
-                return Ok(false);
-            }
-            if self.normal_is_up(&key) {
-                if self.folder_cursor > 0 {
-                    self.folder_cursor -= 1;
+                KeyCode::Down => {
+                    self.tree_shift_move(1)?;
+                    return Ok(false);
                 }
-                self.apply_folder_cursor()?;
-                return Ok(false);
+                _ => {}
             }
-            // Enter or vim 'l': move focus to notes pane
-            if matches!(key.code, KeyCode::Enter)
-                || (self.keymap == KeymapPreset::Vim && key.code == KeyCode::Char('l'))
-            {
-                self.focus = Focus::Notes;
-            }
-            return Ok(false);
         }
 
         if self.normal_is_down(&key) {
-            if self.selected + 1 < self.notes.len() {
-                self.selected += 1;
-                self.load_selected()?;
+            if self.tree_cursor + 1 < self.tree.len() {
+                self.tree_cursor += 1;
+                self.sync_active_note_from_cursor()?;
             }
             return Ok(false);
         }
 
         if self.normal_is_up(&key) {
-            if self.selected > 0 {
-                self.selected -= 1;
-                self.load_selected()?;
+            if self.tree_cursor > 0 {
+                self.tree_cursor -= 1;
+                self.sync_active_note_from_cursor()?;
             }
             return Ok(false);
         }
 
         match key.code {
+            KeyCode::Char(' ') => {
+                if let Some(TreeItem::Folder { name, expanded, .. }) = self.tree.get(self.tree_cursor).cloned() {
+                    if expanded {
+                        self.tree_expanded.remove(&name);
+                    } else {
+                        self.tree_expanded.insert(name);
+                    }
+                    self.rebuild_tree()?;
+                }
+            }
             KeyCode::Char(':') => {
                 self.mode = Mode::Command;
                 self.command_input.clear();
@@ -956,13 +982,26 @@ impl App {
                 let id = self.store.create_note("Untitled", "")?;
                 self.refresh_notes()?;
                 self.select_by_id(id);
-                self.load_selected()?;
+                self.sync_active_note_from_cursor()?;
                 self.enter_edit_mode();
                 self.status = "Created note".to_string();
             }
             KeyCode::Char('e') | KeyCode::Enter => {
-                if self.active_note_id.is_some() {
-                    self.enter_edit_mode();
+                match self.tree.get(self.tree_cursor).cloned() {
+                    Some(TreeItem::Folder { name, expanded, .. }) => {
+                        if expanded {
+                            self.tree_expanded.remove(&name);
+                        } else {
+                            self.tree_expanded.insert(name);
+                        }
+                        self.rebuild_tree()?;
+                    }
+                    Some(TreeItem::Note(_)) => {
+                        if self.active_note_id.is_some() {
+                            self.enter_edit_mode();
+                        }
+                    }
+                    None => {}
                 }
             }
             KeyCode::Char('/') => {
@@ -972,32 +1011,59 @@ impl App {
                 self.status = "Search mode".to_string();
             }
             KeyCode::Char('r') => {
-                self.refresh_notes()?;
-                self.load_selected()?;
-                self.status = "Reloaded".to_string();
-            }
-            KeyCode::Char('f') => {
-                if self.active_note_id.is_some() {
-                    self.folder_pick_cursor = 0;
-                    self.folder_pick_input.clear();
-                    self.folder_pick_typing = false;
-                    self.mode = Mode::FolderPick;
+                match self.tree.get(self.tree_cursor).cloned() {
+                    Some(TreeItem::Folder { name, .. }) => {
+                        self.tree_inline_input = name.clone();
+                        self.tree_inline_mode = TreeInlineMode::RenameFolder(name);
+                    }
+                    Some(TreeItem::Note(n)) => {
+                        self.tree_inline_input = n.title.clone();
+                        self.tree_inline_mode = TreeInlineMode::RenameNote(n.id);
+                    }
+                    None => {
+                        self.refresh_notes()?;
+                        self.status = "Reloaded".to_string();
+                    }
                 }
             }
+            KeyCode::Char('f') => {
+                self.tree_inline_input.clear();
+                self.tree_inline_mode = TreeInlineMode::CreateFolder;
+            }
             KeyCode::Char('d') if !self.delete_pending => {
-                if self.active_note_id.is_some() {
+                if self.tree.get(self.tree_cursor).is_some() {
                     self.delete_pending = true;
-                    self.status =
-                        "Delete? Press d again to confirm, any other key cancels".to_string();
+                    let what = match self.tree.get(self.tree_cursor) {
+                        Some(TreeItem::Folder { name, note_count, .. }) =>
+                            format!("Delete folder '{}' ({} notes lose folder)? Press d to confirm", name, note_count),
+                        Some(TreeItem::Note(n)) =>
+                            format!("Delete '{}'? Press d to confirm", n.title),
+                        _ => "Delete? Press d to confirm".to_string(),
+                    };
+                    self.status = what;
                 }
             }
             KeyCode::Char('d') if self.delete_pending => {
                 self.delete_pending = false;
-                if let Some(id) = self.active_note_id {
-                    self.store.delete_note(id)?;
-                    self.refresh_notes()?;
-                    self.load_selected()?;
-                    self.status = "Note deleted".to_string();
+                match self.tree.get(self.tree_cursor).cloned() {
+                    Some(TreeItem::Folder { name, .. }) => {
+                        self.store.delete_folder(&name)?;
+                        self.tree_expanded.remove(&name);
+                        if self.tree_cursor > 0 { self.tree_cursor -= 1; }
+                        self.rebuild_tree()?;
+                        self.status = format!("Deleted folder '{}'", name);
+                    }
+                    Some(TreeItem::Note(n)) => {
+                        self.store.delete_note(n.id)?;
+                        if self.active_note_id == Some(n.id) {
+                            self.active_note_id = None;
+                            self.load_note_into_editor("");
+                        }
+                        if self.tree_cursor > 0 { self.tree_cursor -= 1; }
+                        self.rebuild_tree()?;
+                        self.status = "Deleted".to_string();
+                    }
+                    None => {}
                 }
             }
             _ => {
@@ -1330,11 +1396,10 @@ impl App {
     fn handle_search_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc => {
-                // Restore the pre-search query
                 self.query = self.pre_search_query.clone();
                 self.refresh_notes()?;
-                self.selected = 0;
-                self.load_selected()?;
+                self.tree_cursor = 0;
+                self.sync_active_note_from_cursor()?;
                 self.mode = Mode::Normal;
                 self.status = "Search canceled".to_string();
             }
@@ -1352,16 +1417,16 @@ impl App {
                 let q = self.search_input.trim().to_string();
                 self.query = q;
                 self.refresh_notes()?;
-                self.selected = 0;
-                self.load_selected()?;
+                self.tree_cursor = 0;
+                self.sync_active_note_from_cursor()?;
             }
             KeyCode::Char(c) => {
                 self.search_input.push(c);
                 let q = self.search_input.trim().to_string();
                 self.query = q;
                 self.refresh_notes()?;
-                self.selected = 0;
-                self.load_selected()?;
+                self.tree_cursor = 0;
+                self.sync_active_note_from_cursor()?;
             }
             _ => {}
         }
@@ -1469,81 +1534,6 @@ impl App {
         Ok(false)
     }
 
-    fn handle_folder_pick_key(&mut self, key: KeyEvent) -> Result<bool> {
-        // Items: folder_list[0..n-1], then "New folder...", then "(remove folder)" if note has one
-        let note_has_folder = self.notes
-            .get(self.selected)
-            .map(|n| !n.folder.is_empty())
-            .unwrap_or(false);
-        let new_idx = self.folder_list.len();
-        let remove_idx = self.folder_list.len() + 1;
-        let total = self.folder_list.len() + 1 + if note_has_folder { 1 } else { 0 };
-
-        if self.folder_pick_typing {
-            match key.code {
-                KeyCode::Esc => {
-                    self.folder_pick_typing = false;
-                }
-                KeyCode::Enter => {
-                    let name = self.folder_pick_input.trim().to_string();
-                    if !name.is_empty() {
-                        if let Some(id) = self.active_note_id {
-                            self.store.set_folder(id, &name)?;
-                            self.refresh_notes()?;
-                            self.select_by_id(id);
-                            self.status = format!("Moved to folder: {}", name);
-                        }
-                    }
-                    self.mode = Mode::Normal;
-                }
-                KeyCode::Backspace => { self.folder_pick_input.pop(); }
-                KeyCode::Char(c) => { self.folder_pick_input.push(c); }
-                _ => {}
-            }
-            return Ok(false);
-        }
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.mode = Mode::Normal;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.folder_pick_cursor + 1 < total {
-                    self.folder_pick_cursor += 1;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.folder_pick_cursor > 0 {
-                    self.folder_pick_cursor -= 1;
-                }
-            }
-            KeyCode::Enter => {
-                if self.folder_pick_cursor == new_idx {
-                    self.folder_pick_typing = true;
-                    self.folder_pick_input.clear();
-                } else if note_has_folder && self.folder_pick_cursor == remove_idx {
-                    if let Some(id) = self.active_note_id {
-                        self.store.set_folder(id, "")?;
-                        self.refresh_notes()?;
-                        self.select_by_id(id);
-                        self.status = "Folder removed".to_string();
-                    }
-                    self.mode = Mode::Normal;
-                } else if self.folder_pick_cursor < self.folder_list.len() {
-                    let name = self.folder_list[self.folder_pick_cursor].clone();
-                    if let Some(id) = self.active_note_id {
-                        self.store.set_folder(id, &name)?;
-                        self.refresh_notes()?;
-                        self.select_by_id(id);
-                        self.status = format!("Moved to folder: {}", name);
-                    }
-                    self.mode = Mode::Normal;
-                }
-            }
-            _ => {}
-        }
-        Ok(false)
-    }
 
     fn update_find_status(&mut self) {
         if self.find_matches.is_empty() {
@@ -1656,7 +1646,7 @@ impl App {
                 let id = self.store.create_note("Untitled", "")?;
                 self.refresh_notes()?;
                 self.select_by_id(id);
-                self.load_selected()?;
+                self.sync_active_note_from_cursor()?;
                 self.enter_edit_mode();
                 self.status = "Created note".to_string();
             }
@@ -1667,15 +1657,15 @@ impl App {
             }
             "reload" => {
                 self.refresh_notes()?;
-                self.load_selected()?;
+                self.sync_active_note_from_cursor()?;
                 self.status = "Reloaded".to_string();
             }
             "search" => {
                 let query = parts.collect::<Vec<_>>().join(" ");
                 self.query = query;
                 self.refresh_notes()?;
-                self.selected = 0;
-                self.load_selected()?;
+                self.tree_cursor = 0;
+                self.sync_active_note_from_cursor()?;
                 self.status = if self.query.is_empty() {
                     "Search cleared".to_string()
                 } else {
@@ -1707,6 +1697,10 @@ impl App {
                 let name = parts.collect::<Vec<_>>().join(" ");
                 if let Some(id) = self.active_note_id {
                     self.store.set_folder(id, &name)?;
+                    // Ensure folder entry exists in folders table
+                    if !name.trim().is_empty() {
+                        let _ = self.store.create_folder(name.trim());
+                    }
                     self.refresh_notes()?;
                     self.select_by_id(id);
                     self.status = if name.trim().is_empty() {
@@ -1742,8 +1736,10 @@ impl App {
                 if let Some(id) = self.active_note_id {
                     self.store.set_archived(id, true)?;
                     self.refresh_notes()?;
-                    self.selected = self.selected.min(self.notes.len().saturating_sub(1));
-                    self.load_selected()?;
+                    if self.tree_cursor >= self.tree.len() && !self.tree.is_empty() {
+                        self.tree_cursor = self.tree.len() - 1;
+                    }
+                    self.sync_active_note_from_cursor()?;
                     self.status = "Note archived".to_string();
                 } else {
                     self.status = "No active note".to_string();
@@ -1793,81 +1789,72 @@ impl App {
         Ok(false)
     }
 
-    fn refresh_folders(&mut self) -> Result<()> {
-        self.folder_list = self.store.list_folders()?;
-        let max = self.folder_list.len();
-        if self.folder_cursor > max {
-            self.folder_cursor = max;
-        }
-        Ok(())
-    }
+    fn rebuild_tree(&mut self) -> Result<()> {
+        self.tree.clear();
+        let folders = self.store.list_folders()?;
+        let query = self.query.clone();
 
-    fn apply_folder_cursor(&mut self) -> Result<()> {
-        self.sidebar_folder = if self.folder_cursor == 0 {
-            None
-        } else {
-            Some(self.folder_list[self.folder_cursor - 1].clone())
-        };
-        self.refresh_notes()?;
-        self.selected = 0;
-        self.load_selected()?;
+        for folder in &folders {
+            let expanded = self.tree_expanded.contains(&folder.name);
+            let notes_in_folder = self.store.list_notes_in_folder(&folder.name, &query)?;
+            let note_count = notes_in_folder.len();
+            self.tree.push(TreeItem::Folder {
+                name: folder.name.clone(),
+                expanded,
+                note_count,
+            });
+            if expanded {
+                for note in notes_in_folder {
+                    self.tree.push(TreeItem::Note(note));
+                }
+            }
+        }
+
+        // Root notes (no folder)
+        let root_notes = self.store.list_notes_in_folder("", &query)?;
+        for note in root_notes {
+            self.tree.push(TreeItem::Note(note));
+        }
+
+        // Clamp cursor
+        if !self.tree.is_empty() && self.tree_cursor >= self.tree.len() {
+            self.tree_cursor = self.tree.len() - 1;
+        }
+
         Ok(())
     }
 
     fn refresh_notes(&mut self) -> Result<()> {
-        let effective_query = match &self.sidebar_folder {
-            Some(f) => {
-                let q = self.query.trim();
-                if q.is_empty() {
-                    format!("/{}", f)
-                } else {
-                    format!("{} /{}", q, f)
+        self.rebuild_tree()?;
+        Ok(())
+    }
+
+    fn sync_active_note_from_cursor(&mut self) -> Result<()> {
+        let note_summary = self.tree.get(self.tree_cursor).and_then(|item| item.note()).cloned();
+        if let Some(summary) = note_summary {
+            if self.active_note_id != Some(summary.id) {
+                self.active_note_id = Some(summary.id);
+                if let Some(note) = self.store.get_note(summary.id)? {
+                    self.load_note_into_editor(&note.body);
                 }
             }
-            None => self.query.clone(),
-        };
-        self.notes = match self.store.list_notes(&effective_query) {
-            Ok(n) => n,
-            Err(e) => {
-                self.status = format!("Search error: {}", e);
-                self.query.clear();
-                self.store.list_notes("")?
-            }
-        };
-        self.refresh_folders()?;
-        if self.notes.is_empty() {
-            self.selected = 0;
+        } else if self.tree.is_empty() {
             self.active_note_id = None;
-            self.editor_buffer = EditorBuffer::new();
-            self.sync_state_from_editor_buffer();
-            self.dirty = false;
-        } else if self.selected >= self.notes.len() {
-            self.selected = self.notes.len() - 1;
+            self.load_note_into_editor("");
         }
         Ok(())
     }
 
-    fn load_selected(&mut self) -> Result<()> {
-        if let Some(note) = self.notes.get(self.selected) {
-            self.active_note_id = Some(note.id);
-            if let Some(full) = self.store.get_note(note.id)? {
-                self.editor_buffer = EditorBuffer::from_text(full.body);
-                self.sync_state_from_editor_buffer();
-                self.dirty = false;
-            }
-        } else {
-            self.active_note_id = None;
-            self.editor_buffer = EditorBuffer::new();
-            self.sync_state_from_editor_buffer();
-            self.dirty = false;
-        }
+    fn load_note_into_editor(&mut self, body: &str) {
+        self.editor_buffer = EditorBuffer::from_text(body.to_string());
+        self.sync_state_from_editor_buffer();
+        self.dirty = false;
         self.lints.clear();
         self.lints_active = false;
         self.selection_anchor = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.preview_scroll = 0;
-        Ok(())
     }
 
     fn save_active_note(&mut self) -> Result<()> {
@@ -1875,19 +1862,151 @@ impl App {
             self.store.update_note(id, &self.editor_buffer.to_text())?;
             self.refresh_notes()?;
             self.select_by_id(id);
-            if self.mode == Mode::Edit {
-                self.dirty = false;
+            if self.mode != Mode::Edit {
+                self.sync_active_note_from_cursor()?;
             } else {
-                self.load_selected()?;
+                self.dirty = false;
             }
         }
         Ok(())
     }
 
     fn select_by_id(&mut self, id: i64) {
-        if let Some(pos) = self.notes.iter().position(|n| n.id == id) {
-            self.selected = pos;
+        if let Some(pos) = self.tree.iter().position(|item| {
+            item.note().map(|n| n.id == id).unwrap_or(false)
+        }) {
+            self.tree_cursor = pos;
         }
+    }
+
+    fn commit_tree_inline(&mut self) -> Result<()> {
+        let input = self.tree_inline_input.trim().to_string();
+        if input.is_empty() {
+            self.tree_inline_mode = TreeInlineMode::None;
+            return Ok(());
+        }
+        match self.tree_inline_mode.clone() {
+            TreeInlineMode::CreateFolder => {
+                self.store.create_folder(&input)?;
+                self.tree_expanded.insert(input.clone());
+                self.status = format!("Created folder: {}", input);
+            }
+            TreeInlineMode::RenameFolder(old_name) => {
+                self.store.rename_folder(&old_name, &input)?;
+                let was_expanded = self.tree_expanded.remove(&old_name);
+                if was_expanded { self.tree_expanded.insert(input.clone()); }
+                self.status = format!("Renamed folder to: {}", input);
+            }
+            TreeInlineMode::RenameNote(id) => {
+                if let Some(note) = self.store.get_note(id)? {
+                    let mut lines: Vec<String> = note.body.lines().map(|l| l.to_string()).collect();
+                    let new_body = if lines.is_empty() {
+                        input.clone()
+                    } else {
+                        lines[0] = input.clone();
+                        lines.join("\n")
+                    };
+                    self.store.update_note(id, &new_body)?;
+                }
+                self.status = format!("Renamed to: {}", input);
+            }
+            TreeInlineMode::None => {}
+        }
+        self.tree_inline_mode = TreeInlineMode::None;
+        self.tree_inline_input.clear();
+        self.rebuild_tree()?;
+        Ok(())
+    }
+
+    fn tree_shift_move(&mut self, direction: i32) -> Result<()> {
+        let cur = self.tree_cursor;
+        if self.tree.is_empty() { return Ok(()); }
+
+        match self.tree.get(cur).cloned() {
+            Some(TreeItem::Folder { name: folder_name, .. }) => {
+                let folders = self.store.list_folders()?;
+                let pos = folders.iter().position(|f| f.name == folder_name);
+                if let Some(idx) = pos {
+                    let swap_idx = if direction < 0 {
+                        if idx == 0 { return Ok(()); }
+                        idx - 1
+                    } else {
+                        if idx + 1 >= folders.len() { return Ok(()); }
+                        idx + 1
+                    };
+                    self.store.swap_folder_order(&folder_name, &folders[swap_idx].name)?;
+                    self.rebuild_tree()?;
+                    if let Some(new_pos) = self.tree.iter().position(|item| item.folder_name() == Some(&folder_name)) {
+                        self.tree_cursor = new_pos;
+                    }
+                }
+            }
+            Some(TreeItem::Note(note)) => {
+                let note_folder = note.folder.clone();
+                let note_id = note.id;
+
+                let target_idx = if direction < 0 {
+                    if cur == 0 { return Ok(()); }
+                    cur - 1
+                } else {
+                    if cur + 1 >= self.tree.len() { return Ok(()); }
+                    cur + 1
+                };
+
+                match self.tree.get(target_idx).cloned() {
+                    Some(TreeItem::Note(other_note)) if other_note.folder == note_folder => {
+                        self.store.swap_note_order(note_id, other_note.id)?;
+                        self.rebuild_tree()?;
+                        self.tree_cursor = target_idx;
+                    }
+                    Some(TreeItem::Note(other_note)) => {
+                        self.store.set_folder(note_id, &other_note.folder)?;
+                        self.store.swap_note_order(note_id, other_note.id)?;
+                        self.rebuild_tree()?;
+                        self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                    }
+                    Some(TreeItem::Folder { name: ref folder_name, expanded, .. }) => {
+                        let folder_name = folder_name.clone();
+                        if direction < 0 {
+                            if target_idx == 0 {
+                                self.store.set_folder(note_id, "")?;
+                                self.rebuild_tree()?;
+                                self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                            } else {
+                                match self.tree.get(target_idx - 1).cloned() {
+                                    Some(TreeItem::Note(prev_note)) => {
+                                        self.store.set_folder(note_id, &prev_note.folder)?;
+                                        self.store.swap_note_order(note_id, prev_note.id)?;
+                                        self.rebuild_tree()?;
+                                        self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                                    }
+                                    _ => {
+                                        self.store.set_folder(note_id, "")?;
+                                        self.rebuild_tree()?;
+                                        self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                                    }
+                                }
+                            }
+                        } else if expanded {
+                            self.store.set_folder(note_id, &folder_name)?;
+                            let folder_notes = self.store.list_notes_in_folder(&folder_name, "")?;
+                            if let Some(first) = folder_notes.first() {
+                                self.store.set_note_order(note_id, first.note_order.saturating_sub(1))?;
+                            }
+                            self.rebuild_tree()?;
+                            self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                        } else {
+                            self.store.set_folder(note_id, "")?;
+                            self.rebuild_tree()?;
+                            self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     fn run_lints(&mut self) {
@@ -2564,13 +2683,14 @@ impl App {
             ("  lints:-".to_string(), palette.muted)
         };
 
+        let note_count = self.tree.iter().filter(|i| i.is_note()).count();
         let top_text = Text::from(Line::from(vec![
             TSpan::styled(
                 format!(
                     " anote  theme:{}  keymap:{}  notes:{}  {}",
                     self.theme.label(),
                     self.keymap.label(),
-                    self.notes.len(),
+                    note_count,
                     query_tag
                 ),
                 Style::default()
@@ -2602,146 +2722,117 @@ impl App {
             .constraints(split)
             .split(layout[1]);
 
-        // Split left pane: folder browser (top) + notes list (bottom)
-        let show_folder_pane = !self.notes_pane_collapsed
-            && !matches!(self.mode, Mode::Edit | Mode::Find);
-        let folder_pane_h: u16 = if show_folder_pane {
-            let items = self.folder_list.len() + 1; // +1 for "All Notes"
-            (items as u16 + 2).min(10) // +2 borders, cap at 10 rows
-        } else {
-            0
-        };
-        let left_split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(folder_pane_h), Constraint::Min(1)])
-            .split(main[0]);
-        let folder_area = left_split[0];
-        let notes_area = left_split[1];
+        let notes_area = main[0];
 
-        if show_folder_pane {
-            let folder_focused = self.focus == Focus::Folders;
-            let folder_items: Vec<ListItem> = std::iter::once("All Notes".to_string())
-                .chain(self.folder_list.iter().cloned())
-                .enumerate()
-                .map(|(i, name)| {
-                    let is_cursor = i == self.folder_cursor;
-                    let style = if is_cursor && folder_focused {
-                        Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD)
-                    } else if is_cursor {
-                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(palette.text)
-                    };
-                    let label = if i == 0 {
-                        format!("  {}", name)
-                    } else {
-                        format!("  {}/", name)
-                    };
-                    ListItem::new(TSpan::styled(label, style))
-                })
-                .collect();
+        // Build tree list items
+        let list_items: Vec<ListItem> = {
+            let mut items: Vec<ListItem> = Vec::new();
+            let tree_len = self.tree.len();
 
-            let folder_block = Block::default()
-                .title(" Folders ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(
-                    if folder_focused { palette.accent } else { palette.muted }
-                ))
-                .style(Style::default().bg(palette.bg));
+            if tree_len == 0 && self.tree_inline_mode != TreeInlineMode::CreateFolder {
+                items.push(ListItem::new(Line::styled(
+                    "No notes. Press 'n' to create, 'f' for folder.",
+                    Style::default().fg(palette.muted),
+                )));
+            }
 
-            frame.render_widget(List::new(folder_items).block(folder_block), folder_area);
-        }
+            for idx in 0..tree_len {
+                let item = &self.tree[idx];
+                let is_selected = idx == self.tree_cursor;
+                let base_style = if is_selected {
+                    Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.text)
+                };
 
-        let list_items: Vec<ListItem> = if self.notes.is_empty() {
-            vec![ListItem::new(Line::styled(
-                "No notes. Press 'n' to create one.",
-                Style::default().fg(palette.muted),
-            ))]
-        } else {
-            self.notes
-                .iter()
-                .enumerate()
-                .map(|(idx, n)| {
-                    let ts = short_timestamp(&n.updated_at);
-                    let selected_row = idx == self.selected;
-                    let mut spans: Vec<TSpan<'static>> = Vec::new();
-
-                    if n.pinned {
-                        spans.push(if selected_row {
-                            TSpan::styled("* ", Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD))
+                let list_item = match item {
+                    TreeItem::Folder { name, expanded, note_count } => {
+                        // If renaming this folder, show inline input
+                        if matches!(&self.tree_inline_mode, TreeInlineMode::RenameFolder(n) if n == name) {
+                            let input_line = format!("\u{f0153} {}█", self.tree_inline_input);
+                            ListItem::new(TSpan::styled(input_line, Style::default().fg(palette.accent)))
                         } else {
-                            TSpan::styled("* ", Style::default().fg(palette.ok).add_modifier(Modifier::BOLD))
-                        });
-                    }
-                    if n.archived {
-                        spans.push(if selected_row {
-                            TSpan::styled("[arch] ", Style::default().bg(palette.accent).fg(palette.bg))
-                        } else {
-                            TSpan::styled("[arch] ", Style::default().fg(palette.muted))
-                        });
-                    }
-
-                    if !n.folder.is_empty() {
-                        let folder_text = format!("{}/", n.folder);
-                        let sp = if selected_row {
-                            TSpan::styled(
-                                folder_text,
-                                Style::default()
-                                    .bg(palette.accent)
-                                    .fg(palette.bg)
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                        } else {
-                            TSpan::styled(folder_text, Style::default().fg(palette.muted))
-                        };
-                        spans.push(sp);
-                    }
-
-                    let title_sp = if selected_row {
-                        TSpan::styled(
-                            n.title.clone(),
-                            Style::default()
-                                .bg(palette.accent)
-                                .fg(palette.bg)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        TSpan::styled(n.title.clone(), Style::default().fg(palette.text))
-                    };
-                    spans.push(title_sp);
-
-                    let ts_text = format!("  {}", ts);
-                    let ts_sp = if selected_row {
-                        TSpan::styled(
-                            ts_text,
-                            Style::default()
-                                .bg(palette.accent)
-                                .fg(palette.bg)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        TSpan::styled(ts_text, Style::default().fg(palette.muted))
-                    };
-                    spans.push(ts_sp);
-
-                    let title_line = Line::from(spans);
-
-                    if !n.tags.is_empty() {
-                        let pill_colors = self.theme.tag_pill_colors();
-                        let mut tag_spans: Vec<TSpan<'static>> = vec![TSpan::raw("  ")];
-                        for tag in n.tags.split_whitespace() {
-                            tag_spans.push(TSpan::styled(
-                                format!(" #{} ", tag),
-                                pill_style_for_tag(tag, pill_colors),
-                            ));
-                            tag_spans.push(TSpan::raw(" "));
+                            let icon = if *expanded { "\u{f0176} " } else { "\u{f0153} " };
+                            let count_text = format!("  ({})", note_count);
+                            let mut spans = vec![
+                                TSpan::styled(icon.to_string(), if is_selected { base_style } else { Style::default().fg(palette.accent) }),
+                                TSpan::styled(name.clone(), base_style),
+                            ];
+                            if !is_selected {
+                                spans.push(TSpan::styled(count_text, Style::default().fg(palette.muted)));
+                            }
+                            ListItem::new(Line::from(spans))
                         }
-                        ListItem::new(Text::from(vec![title_line, Line::from(tag_spans)]))
-                    } else {
-                        ListItem::new(Text::from(vec![title_line]))
                     }
-                })
-                .collect()
+                    TreeItem::Note(note) => {
+                        let in_folder = !note.folder.is_empty();
+                        let is_last_in_group = {
+                            let next = self.tree.get(idx + 1);
+                            match next {
+                                None => true,
+                                Some(TreeItem::Note(n)) => n.folder != note.folder,
+                                Some(TreeItem::Folder { .. }) => true,
+                            }
+                        };
+                        let tree_prefix = if in_folder {
+                            if is_last_in_group { "\u{2514} " } else { "\u{251c} " }
+                        } else {
+                            "  "
+                        };
+                        let note_icon = if note.pinned { "\u{f0403} " } else { "\u{f0219} " };
+                        let ts = short_timestamp(&note.updated_at);
+
+                        // If renaming this note, show inline input
+                        if matches!(&self.tree_inline_mode, TreeInlineMode::RenameNote(id) if *id == note.id) {
+                            let input_line = format!("{}{} {}█", tree_prefix, note_icon, self.tree_inline_input);
+                            ListItem::new(TSpan::styled(input_line, Style::default().fg(palette.accent)))
+                        } else {
+                            let spans = vec![
+                                TSpan::styled(tree_prefix.to_string(), Style::default().fg(palette.muted)),
+                                TSpan::styled(note_icon.to_string(), if is_selected { base_style } else { Style::default().fg(palette.muted) }),
+                                TSpan::styled(note.title.clone(), base_style),
+                                TSpan::styled(format!("  {}", ts), if is_selected { base_style } else { Style::default().fg(palette.muted) }),
+                            ];
+
+                            let mut lines = vec![Line::from(spans)];
+                            if !note.tags.is_empty() {
+                                let tag_indent = if in_folder { "\u{2502}  " } else { "   " };
+                                let pill_colors = self.theme.tag_pill_colors();
+                                let mut tag_spans: Vec<TSpan<'static>> = vec![TSpan::styled(tag_indent.to_string(), Style::default().fg(palette.muted))];
+                                for tag in note.tags.split_whitespace() {
+                                    tag_spans.push(TSpan::styled(
+                                        format!(" #{} ", tag),
+                                        pill_style_for_tag(tag, pill_colors),
+                                    ));
+                                    tag_spans.push(TSpan::raw(" "));
+                                }
+                                lines.push(Line::from(tag_spans));
+                            }
+
+                            if lines.len() == 1 {
+                                ListItem::new(lines.remove(0))
+                            } else {
+                                ListItem::new(Text::from(lines))
+                            }
+                        }
+                    }
+                };
+                items.push(list_item);
+
+                // After current item, insert create-folder input if in CreateFolder mode
+                if self.tree_inline_mode == TreeInlineMode::CreateFolder && idx == self.tree_cursor {
+                    let input_line = format!("\u{f0153} {}█", self.tree_inline_input);
+                    items.push(ListItem::new(TSpan::styled(input_line, Style::default().fg(palette.accent))));
+                }
+            }
+
+            // If tree is empty and creating folder
+            if tree_len == 0 && self.tree_inline_mode == TreeInlineMode::CreateFolder {
+                let input_line = format!("\u{f0153} {}█", self.tree_inline_input);
+                items.push(ListItem::new(TSpan::styled(input_line, Style::default().fg(palette.accent))));
+            }
+
+            items
         };
 
         let list_border_color = if self.mode == Mode::Normal {
@@ -2756,7 +2847,13 @@ impl App {
             .style(Style::default().bg(palette.panel).fg(palette.text))
             .border_style(Style::default().fg(list_border_color));
         if self.mode != Mode::Edit {
-            frame.render_widget(List::new(list_items).block(list_block), notes_area);
+            let mut list_state = ratatui::widgets::ListState::default();
+            list_state.select(Some(self.tree_cursor));
+            frame.render_stateful_widget(
+                List::new(list_items).block(list_block).highlight_style(Style::default()),
+                notes_area,
+                &mut list_state,
+            );
         }
 
         let meta_base = Style::default()
@@ -2795,7 +2892,7 @@ impl App {
             Mode::Search => " Preview ",
             Mode::Command => " Preview ",
             Mode::Find => " Edit (find) ",
-            Mode::Help | Mode::FolderPick => " Preview ",
+            Mode::Help => " Preview ",
         };
 
         let editor_border_color = if self.mode == Mode::Edit {
@@ -2895,7 +2992,6 @@ impl App {
             Mode::Command => "COMMAND",
             Mode::Find => "FIND",
             Mode::Help => "HELP",
-            Mode::FolderPick => "FOLDER",
         };
         let dirty_text = if self.dirty { "*" } else { "" };
 
@@ -2907,6 +3003,17 @@ impl App {
             }
         } else {
             ""
+        };
+
+        let inline_hint = if self.tree_inline_mode != TreeInlineMode::None {
+            match &self.tree_inline_mode {
+                TreeInlineMode::CreateFolder => format!("  New folder: {}█  Enter confirm  Esc cancel", self.tree_inline_input),
+                TreeInlineMode::RenameFolder(_) => format!("  Rename: {}█  Enter confirm  Esc cancel", self.tree_inline_input),
+                TreeInlineMode::RenameNote(_) => format!("  Rename: {}█  Enter confirm  Esc cancel", self.tree_inline_input),
+                TreeInlineMode::None => String::new(),
+            }
+        } else {
+            String::new()
         };
 
         let status_line = match self.mode {
@@ -2922,14 +3029,17 @@ impl App {
                 )
             }
             Mode::Help => "  j/k scroll  Esc/? close".to_string(),
-            Mode::FolderPick => "  j/k navigate  Enter select  Esc cancel".to_string(),
             _ => {
-                format!(
-                    "[{mode}] {status} {dirty} | : command  n new  d delete  \\ pane | F6 theme | F7 keymap | ? help | q quit",
-                    mode = mode_text,
-                    status = self.status,
-                    dirty = dirty_text,
-                )
+                if !inline_hint.is_empty() {
+                    inline_hint.clone()
+                } else {
+                    format!(
+                        "[{mode}] {status} {dirty} | : command  n new  f folder  r rename  d delete  \\ pane | F6 theme | F7 keymap | ? help | q quit",
+                        mode = mode_text,
+                        status = self.status,
+                        dirty = dirty_text,
+                    )
+                }
             }
         };
 
@@ -2952,80 +3062,8 @@ impl App {
         if self.mode == Mode::Help {
             self.render_help_overlay(frame, palette);
         }
-        if self.mode == Mode::FolderPick {
-            self.render_folder_pick_overlay(frame, palette);
-        }
-
     }
 
-    fn render_folder_pick_overlay(&mut self, frame: &mut Frame, palette: Palette) {
-        let note_has_folder = self.notes
-            .get(self.selected)
-            .map(|n| !n.folder.is_empty())
-            .unwrap_or(false);
-
-        // Build item labels
-        let mut labels: Vec<String> = self.folder_list
-            .iter()
-            .map(|f| format!("  {}/", f))
-            .collect();
-        labels.push("  + New folder...".to_string());
-        if note_has_folder {
-            labels.push("  ✕ Remove from folder".to_string());
-        }
-
-        let area = frame.area();
-        let w = 36u16.min(area.width);
-        let h = (labels.len() as u16 + 2 + if self.folder_pick_typing { 2 } else { 0 }).min(area.height);
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = area.y + (area.height.saturating_sub(h)) / 2;
-        let popup = Rect { x, y, width: w, height: h };
-
-        frame.render_widget(Clear, popup);
-
-        let block = Block::default()
-            .title(" Move to Folder ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette.accent))
-            .style(Style::default().bg(palette.bg).fg(palette.text));
-
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-
-        // Split inner: list on top, input at bottom when typing
-        let (list_area, input_area) = if self.folder_pick_typing {
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(1)])
-                .split(inner);
-            (split[0], Some(split[1]))
-        } else {
-            (inner, None)
-        };
-
-        let new_idx = self.folder_list.len();
-        let list_items: Vec<ListItem> = labels.iter().enumerate().map(|(i, label)| {
-            let is_cursor = i == self.folder_pick_cursor;
-            let is_new = i == new_idx;
-            let style = if is_cursor {
-                Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD)
-            } else if is_new {
-                Style::default().fg(palette.accent)
-            } else {
-                Style::default().fg(palette.text)
-            };
-            ListItem::new(TSpan::styled(label.clone(), style))
-        }).collect();
-
-        frame.render_widget(List::new(list_items), list_area);
-
-        if let Some(input_area) = input_area {
-            let input_text = format!("> {}_", self.folder_pick_input);
-            let input = Paragraph::new(input_text)
-                .style(Style::default().fg(palette.accent));
-            frame.render_widget(input, input_area);
-        }
-    }
 
     fn render_help_overlay(&mut self, frame: &mut Frame, palette: Palette) {
         let area = frame.area();
@@ -3060,24 +3098,19 @@ impl App {
         let lines: Vec<Line> = vec![
             pad(),
             heading("  NORMAL MODE"),
-            row("j/k  ↑↓",        "navigate notes"),
-            row("Enter / e",       "open note"),
+            row("j/k  ↑↓",        "navigate tree"),
+            row("Space/Enter",     "expand/collapse folder"),
+            row("Enter / e",       "open note for edit"),
             row("n",               "new note"),
-            row("d d",             "delete note"),
+            row("f",               "new folder"),
+            row("r",               "rename note or folder"),
+            row("d d",             "delete note or folder"),
+            row("Shift+↑↓",        "move note/folder"),
             row("/",               "search notes"),
             row(":",               "command palette"),
             row("\\",              "toggle notes pane"),
-            row("Tab",             "focus folder browser"),
-            row("f",               "move note to folder"),
             row("q",               "quit"),
             row("#tag in body",    "add tag to note"),
-            pad(),
-            heading("  FOLDER BROWSER"),
-            row("j/k",             "navigate folders"),
-            row("Enter",           "select folder / focus notes"),
-            row("Tab",             "switch focus back to notes"),
-            row(":folder <name>",  "assign note to folder"),
-            row(":folder",         "remove note from folder"),
             pad(),
             heading("  COLLAPSED PANE"),
             row("j/k  ↑↓",        "scroll preview"),
