@@ -2,22 +2,22 @@
 
 Keyboard-first TUI note-taking app in Rust.
 
-## Current features
+## Features
 
-- SQLite-backed notes
-- Full-text search with FTS5
-- TUI list + editor with vim/default presets
-- Command palette (`:`) with app actions
-- Theme/keymap/density persisted to config
-- Quick CLI capture
-- CLI search
+- SQLite-backed notes with FTS5 full-text search
+- Markdown preview with syntax highlighting in code blocks
+- Inline spell/grammar linting (harper-core) with one-key fixes
+- In-note find with live match highlighting and two-phase navigation
+- Folders, tags, pin, archive
+- Vim and default keymaps
+- Three themes: neo-noir, paper, matrix
+- Collapsible notes pane with scrollable preview
+- Command palette (`:`), quick CLI capture, CLI search
 
 ## Usage
 
-Build:
-
 ```bash
-cargo build
+cargo build --release
 ```
 
 Run TUI:
@@ -43,12 +43,10 @@ cargo run -- search "Ship"
 
 ## Data directory
 
-Default behavior:
+- Linux default: `~/.local/share/anote/`
+- Falls back to `./.anote/`
 
-- Uses local data directory when writable (`~/.local/share/anote` on Linux)
-- Falls back to `./.anote/` when that location is unavailable
-
-Override location:
+Override:
 
 ```bash
 ANOTE_DATA_DIR=/path/to/data cargo run
@@ -56,12 +54,10 @@ ANOTE_DATA_DIR=/path/to/data cargo run
 
 ## Config file
 
-Default behavior:
+- Linux default: `~/.config/anote/config.toml`
+- Falls back to `./.anote/config.toml`
 
-- Uses config directory when writable (`~/.config/anote/config.toml` on Linux)
-- Falls back to `./.anote/config.toml` if needed
-
-Override location:
+Override:
 
 ```bash
 ANOTE_CONFIG_PATH=/path/to/config.toml cargo run
@@ -69,48 +65,103 @@ ANOTE_CONFIG_PATH=/path/to/config.toml cargo run
 
 ## TUI keybindings
 
-- `q`: quit
-- `j`/`k` or arrows: move selection
-- `n`: new note
-- `e` or `Enter`: edit selected note
-- `Arrow keys`: move cursor while editing
-- `Home`/`End`: jump to line start/end
-- `Backspace`/`Delete`: delete before/at cursor
-- `Ctrl+s`: save while editing
-- `Esc`: exit edit/search mode
-- `/`: search mode
-- `r`: reload notes
-- `:`: command palette
-- `F6`: cycle theme (`neo-noir`, `paper`, `matrix`)
-- `F7`: cycle keymap (`default`, `vim`)
-- `F8`: toggle density (`cozy`, `compact`)
+### Normal mode
 
-### Command palette
+| Key | Action |
+|-----|--------|
+| `j` / `k` or `↑` / `↓` | navigate notes |
+| `n` | new note |
+| `e` or `Enter` | open note in editor |
+| `d d` | delete note |
+| `/` | search / filter notes |
+| `:` | command palette |
+| `\` | toggle notes pane |
+| `r` | reload notes |
+| `?` | help overlay |
+| `q` | quit |
+| `F6` | cycle theme |
+| `F7` | cycle keymap |
 
-- `:new`
-- `:edit`
-- `:search <query>`
-- `:theme neo-noir|paper|matrix`
-- `:keymap default|vim`
-- `:density cozy|compact|toggle`
-- `:reload`
-- `:help`
-- `:quit`
+### Collapsed pane (preview only)
 
-### Vim preset extras
+| Key | Action |
+|-----|--------|
+| `j` / `k` or `↑` / `↓` | scroll preview one line |
+| `PgDn` / `PgUp` | scroll preview fast |
 
-- Edit opens in vim normal mode
-- `l`: open the selected note from the notes pane
-- `h`: return to the notes pane from vim normal mode at column 0
-- `i`, `a`, `I`, `A`: enter insert mode variants
-- `h`, `j`, `k`, `l`: move cursor in vim normal mode
-- `0`, `$`: line start/end
-- `o`, `O`: open line below/above
-- `x`: delete at cursor
-- `Esc`: insert->normal, or normal->app normal mode
+### Edit mode
 
-## Next targets
+| Key | Action |
+|-----|--------|
+| `Esc` | exit to preview |
+| `Ctrl+S` | save |
+| `Ctrl+Z` / `Ctrl+Y` | undo / redo |
+| `Ctrl+C` / `Ctrl+X` | copy / cut |
+| `Ctrl+V` | paste from clipboard |
+| `Ctrl+F` | find in note |
+| `Ctrl+L` | run spell/grammar lint |
+| `Tab` | apply first lint suggestion at cursor |
+| `]` / `[` | jump to next / prev lint |
 
-- Tags and backlinks
-- Daily notes and templates
-- Sync engine
+### Find mode (Ctrl+F, default keymap)
+
+Type freely to build the query — all characters including `n`/`N` go into the search term. Matches highlight live.
+
+| Key | Action |
+|-----|--------|
+| `↓` / `↑` | next / prev match while typing |
+| `Enter` or `Tab` | commit query → navigation phase |
+| `Esc` | cancel find |
+
+Navigation phase (after Enter):
+
+| Key | Action |
+|-----|--------|
+| `n` / `↓` | next match |
+| `N` / `↑` | prev match |
+| `Enter` | enter edit mode at current match |
+| `Backspace` | return to typing phase |
+| any char | restart typing with that character |
+| `Esc` | close find |
+
+### Search (/ to enter)
+
+| Token | Effect |
+|-------|--------|
+| `#tag` | filter by tag |
+| `/folder` | filter by folder |
+| `:archived` | show archived notes |
+| plain text | full-text search |
+
+### Vim keymap extras
+
+| Key | Action |
+|-----|--------|
+| `h` `j` `k` `l` | move cursor |
+| `i` / `a` | enter insert mode |
+| `v` | visual select |
+| `y` / `d` | yank / delete |
+| `p` / `P` | paste from system clipboard |
+| `u` / `Ctrl+R` | undo / redo |
+| `l` (normal mode) | open selected note from notes pane |
+
+## Command palette
+
+| Command | Description |
+|---------|-------------|
+| `:new` | create a new note |
+| `:edit` | open note in editor |
+| `:folder <name>` | move note to folder (blank = remove) |
+| `:pin` / `:unpin` | pin note to top of list |
+| `:archive` | hide note from main list |
+| `:unarchive` | restore an archived note |
+| `:search <query>` | run a search programmatically |
+| `:theme <name>` | `neo-noir` \| `paper` \| `matrix` |
+| `:keymap <name>` | `default` \| `vim` |
+| `:reload` | refresh note list |
+| `:w` | save |
+| `:q` / `:quit` | quit |
+
+## Tags
+
+Write `#tagname` anywhere in a note body — tags are extracted automatically and searchable with `#tag` in the search bar.

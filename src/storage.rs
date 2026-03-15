@@ -9,6 +9,8 @@ pub struct NoteSummary {
     pub updated_at: String,
     pub folder: String,
     pub tags: String,
+    pub pinned: bool,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -87,13 +89,19 @@ impl Store {
     }
 
     pub fn list_notes(&self, query: &str) -> Result<Vec<NoteSummary>> {
-        let (tags, folder, fts) = parse_query(query);
+        let (tags, folder, show_archived, fts) = parse_query(query);
 
         let mut notes = Vec::new();
 
+        let archive_clause = if show_archived {
+            "n.archived = 1".to_string()
+        } else {
+            "n.archived = 0".to_string()
+        };
+
         if fts.is_empty() {
             // No FTS — scan notes table directly
-            let mut where_clauses: Vec<String> = vec!["n.archived = 0".to_string()];
+            let mut where_clauses: Vec<String> = vec![archive_clause];
             let mut bind_vals: Vec<String> = Vec::new();
 
             for tag in &tags {
@@ -107,7 +115,7 @@ impl Store {
             }
 
             let sql = format!(
-                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags \
+                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived \
                  FROM notes n \
                  WHERE {} \
                  ORDER BY n.pinned DESC, n.updated_at DESC LIMIT 500",
@@ -124,6 +132,8 @@ impl Store {
                         updated_at: row.get(2)?,
                         folder: row.get(3)?,
                         tags: row.get(4)?,
+                        pinned: row.get::<_, i64>(5)? != 0,
+                        archived: row.get::<_, i64>(6)? != 0,
                     })
                 },
             )?;
@@ -133,7 +143,7 @@ impl Store {
         } else {
             // FTS query
             let mut where_clauses: Vec<String> =
-                vec!["notes_fts MATCH ?".to_string(), "n.archived = 0".to_string()];
+                vec!["notes_fts MATCH ?".to_string(), archive_clause];
             let mut bind_vals: Vec<String> = vec![fts.clone()];
 
             for tag in &tags {
@@ -147,7 +157,7 @@ impl Store {
             }
 
             let sql = format!(
-                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags \
+                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived \
                  FROM notes_fts f \
                  JOIN notes n ON n.id = f.rowid \
                  WHERE {} \
@@ -165,6 +175,8 @@ impl Store {
                         updated_at: row.get(2)?,
                         folder: row.get(3)?,
                         tags: row.get(4)?,
+                        pinned: row.get::<_, i64>(5)? != 0,
+                        archived: row.get::<_, i64>(6)? != 0,
                     })
                 },
             )?;
@@ -223,6 +235,22 @@ impl Store {
         self.conn.execute(
             "UPDATE notes SET folder = ?1 WHERE id = ?2",
             params![folder.trim(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_pinned(&self, id: i64, pinned: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE notes SET pinned = ?1 WHERE id = ?2",
+            params![pinned as i64, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_archived(&self, id: i64, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE notes SET archived = ?1 WHERE id = ?2",
+            params![archived as i64, id],
         )?;
         Ok(())
     }
@@ -294,17 +322,21 @@ fn extract_tags(body: &str) -> String {
     tags.join(" ")
 }
 
-/// Parse a search query into (tags, folder, fts_text).
+/// Parse a search query into (tags, folder, show_archived, fts_text).
 /// Tokens starting with '#' → tag filter (lowercased, no '#').
 /// Tokens starting with '/' → folder filter (lowercased, no '/'; last one wins).
+/// Token `:archived` → show archived notes instead of active ones.
 /// Everything else → FTS text (rejoined).
-fn parse_query(query: &str) -> (Vec<String>, Option<String>, String) {
+fn parse_query(query: &str) -> (Vec<String>, Option<String>, bool, String) {
     let mut tags: Vec<String> = Vec::new();
     let mut folder: Option<String> = None;
+    let mut show_archived = false;
     let mut fts_tokens: Vec<String> = Vec::new();
 
     for token in query.split_whitespace() {
-        if let Some(rest) = token.strip_prefix('#') {
+        if token.eq_ignore_ascii_case(":archived") {
+            show_archived = true;
+        } else if let Some(rest) = token.strip_prefix('#') {
             if !rest.is_empty() {
                 tags.push(rest.to_ascii_lowercase());
             }
@@ -318,5 +350,5 @@ fn parse_query(query: &str) -> (Vec<String>, Option<String>, String) {
     }
 
     let fts = fts_tokens.join(" ");
-    (tags, folder, fts)
+    (tags, folder, show_archived, fts)
 }

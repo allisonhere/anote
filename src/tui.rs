@@ -3,9 +3,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use edtui::{
+    EditorEventHandler, EditorMode, EditorState as EdtuiState, EditorTheme, EditorView,
+    LineNumbers, Lines,
+    actions::{Execute, InsertChar},
 };
 use ratatui::{
     Frame, Terminal,
@@ -13,13 +21,21 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span as TSpan, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Widget},
 };
 
 use harper_core::linting::{LintGroup, Linter};
+use pulldown_cmark::{
+    Event as MdEvent, HeadingLevel, Options as MdOptions, Parser as MdParser, Tag as MdTag,
+    TagEnd as MdTagEnd,
+};
 use harper_core::parsers::PlainEnglish;
 use harper_core::spell::FstDictionary;
 use harper_core::{Dialect, Document};
+
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
 
 use crate::config::AppConfig;
 use crate::storage::{NoteSummary, Store};
@@ -33,13 +49,8 @@ enum Mode {
     Edit,
     Search,
     Command,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VimMode {
-    Normal,
-    Insert,
-    Visual,
+    Find,
+    Help,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,16 +294,6 @@ impl EditorBuffer {
         self.lines.insert(self.cursor_row, tail);
     }
 
-    fn open_line_below(&mut self) {
-        self.move_end();
-        self.insert_newline();
-    }
-
-    fn open_line_above(&mut self) {
-        self.lines.insert(self.cursor_row, String::new());
-        self.cursor_col = 0;
-    }
-
     fn backspace(&mut self) {
         if self.cursor_col > 0 {
             let start = byte_idx_from_char_idx(&self.lines[self.cursor_row], self.cursor_col - 1);
@@ -475,11 +476,12 @@ pub struct App {
     selected: usize,
     active_note_id: Option<i64>,
     editor_buffer: EditorBuffer,
+    editor_state: EdtuiState,
+    editor_events: EditorEventHandler,
     query: String,
     search_input: String,
     command_input: String,
     mode: Mode,
-    vim_mode: VimMode,
     status: String,
     dirty: bool,
     theme: ThemeName,
@@ -498,6 +500,14 @@ pub struct App {
     clipboard: Option<Clipboard>,
     undo_stack: Vec<EditorBuffer>,
     redo_stack: Vec<EditorBuffer>,
+    find_query: String,
+    find_matches: Vec<usize>, // flat char offsets of match starts
+    find_cursor: usize,       // index into find_matches
+    find_committed: bool,     // true = navigation phase; false = typing phase
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
+    notes_pane_collapsed: bool,
+    preview_scroll: u16,
 }
 
 impl App {
@@ -510,11 +520,12 @@ impl App {
             selected: 0,
             active_note_id: None,
             editor_buffer: EditorBuffer::new(),
+            editor_state: EdtuiState::new(Lines::from("")),
+            editor_events: EditorEventHandler::emacs_mode(),
             query: String::new(),
             search_input: String::new(),
             command_input: String::new(),
             mode: Mode::Normal,
-            vim_mode: VimMode::Insert,
             status: "Ready".to_string(),
             dirty: false,
             theme: ThemeName::from_label(&config.theme).unwrap_or(ThemeName::NeoNoir),
@@ -537,7 +548,16 @@ impl App {
             clipboard: Clipboard::new().ok(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            find_query: String::new(),
+            find_matches: Vec::new(),
+            find_cursor: 0,
+            find_committed: false,
+            syntax_set: SyntaxSet::load_defaults_newlines(),
+            theme_set: ThemeSet::load_defaults(),
+            notes_pane_collapsed: false,
+            preview_scroll: 0,
         };
+        app.apply_editor_keymap();
         app.refresh_notes()?;
         app.load_selected()?;
         Ok(app)
@@ -546,14 +566,19 @@ impl App {
     pub fn run(mut self) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
         let loop_result = self.event_loop(&mut terminal);
 
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(
+            terminal.backend_mut(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )?;
         terminal.show_cursor()?;
 
         loop_result
@@ -568,27 +593,65 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    if self.handle_key(key)? {
-                        return Ok(());
-                    }
+                let event = event::read()?;
+                if self.handle_event(event)? {
+                    return Ok(());
                 }
             }
 
             if self.dirty {
                 if let Some(t) = self.last_edit {
                     if t.elapsed() >= Duration::from_secs(AUTO_SAVE_SECS) {
-                        let saved_row = self.editor_buffer.cursor_row;
-                        let saved_col = self.editor_buffer.cursor_col;
                         let _ = self.save_active_note();
-                        self.editor_buffer.cursor_row =
-                            saved_row.min(self.editor_buffer.lines.len().saturating_sub(1));
-                        self.editor_buffer.cursor_col =
-                            saved_col.min(self.editor_buffer.current_line_len());
+                        // For vim mode, restore edtui cursor/mode after save since
+                        // save_active_note may reorder the note list but leaves editor_state
+                        // cursor unclamped. Default mode uses editor_buffer directly — no sync needed.
+                        if self.keymap == KeymapPreset::Vim {
+                            let row = self.editor_state.cursor.row
+                                .min(self.editor_buffer.lines.len().saturating_sub(1));
+                            let col = self.editor_state.cursor.col
+                                .min(self.editor_buffer.current_line_len());
+                            self.editor_state.cursor.row = row;
+                            self.editor_state.cursor.col = col;
+                        }
                         self.last_edit = None;
                     }
                 }
             }
+        }
+    }
+
+    fn handle_event(&mut self, event: Event) -> Result<bool> {
+        match event {
+            Event::Key(key) => self.handle_key(key),
+            // Bracketed paste: handle directly for default mode to avoid stale editor_state.
+            Event::Paste(text) if self.mode == Mode::Edit => {
+                match self.keymap {
+                    KeymapPreset::Default => {
+                        self.push_undo();
+                        self.delete_selection();
+                        self.editor_buffer.insert_pasted_str(&text);
+                        self.dirty = true;
+                        self.last_edit = Some(Instant::now());
+                        if self.lints_active {
+                            self.run_lints();
+                        }
+                    }
+                    KeymapPreset::Vim => {
+                        let before = self.editor_state.lines.to_string();
+                        self.editor_events.on_event(Event::Paste(text), &mut self.editor_state);
+                        self.sync_after_editor_event(before);
+                    }
+                }
+                Ok(false)
+            }
+            Event::Mouse(_) if self.mode == Mode::Edit => {
+                let before = self.editor_state.lines.to_string();
+                self.editor_events.on_event(event, &mut self.editor_state);
+                self.sync_after_editor_event(before);
+                Ok(false)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -602,6 +665,7 @@ impl App {
             }
             KeyCode::F(7) => {
                 self.keymap = self.keymap.next();
+                self.apply_editor_keymap();
                 self.persist_preferences();
                 self.status = format!("Keymap -> {}", self.keymap.label());
                 return Ok(false);
@@ -620,6 +684,13 @@ impl App {
             Mode::Edit => self.handle_edit_key(key),
             Mode::Search => self.handle_search_key(key),
             Mode::Command => self.handle_command_key(key),
+            Mode::Find => self.handle_find_key(key),
+            Mode::Help => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
+                    self.mode = Mode::Normal;
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -634,103 +705,84 @@ impl App {
         }
     }
 
+    fn apply_editor_keymap(&mut self) {
+        if self.keymap == KeymapPreset::Vim {
+            self.editor_events = EditorEventHandler::vim_mode();
+            self.editor_state.mode = EditorMode::Normal;
+            self.sync_state_from_editor_buffer();
+        }
+        // Default mode uses EditorBuffer directly; no edtui setup needed.
+    }
+
+    fn sync_state_from_editor_buffer(&mut self) {
+        let text = self.editor_buffer.to_text();
+        let mut state = EdtuiState::new(Lines::from(text.as_str()));
+        state.cursor.row = self
+            .editor_buffer
+            .cursor_row
+            .min(self.editor_buffer.lines.len().saturating_sub(1));
+        state.cursor.col = self.editor_buffer.cursor_col.min(self.editor_buffer.current_line_len());
+        state.mode = match self.keymap {
+            KeymapPreset::Default => EditorMode::Insert,
+            KeymapPreset::Vim => self.editor_state.mode,
+        };
+        self.editor_state = state;
+    }
+
+    fn sync_editor_buffer_from_state(&mut self) {
+        self.editor_buffer = EditorBuffer::from_text(self.editor_state.lines.to_string());
+        self.editor_buffer.cursor_row = self
+            .editor_state
+            .cursor
+            .row
+            .min(self.editor_buffer.lines.len().saturating_sub(1));
+        self.editor_buffer.cursor_col = self.editor_state.cursor.col.min(
+            self.editor_buffer.lines[self.editor_buffer.cursor_row]
+                .chars()
+                .count(),
+        );
+    }
+
+    // Update editor_state cursor position from editor_buffer without recreating state.
+    // Use this after modifying editor_buffer cursor in vim mode to avoid losing edtui undo history.
+    fn sync_cursor_to_state(&mut self) {
+        let row = self.editor_buffer.cursor_row
+            .min(self.editor_buffer.lines.len().saturating_sub(1));
+        let col = self.editor_buffer.cursor_col
+            .min(self.editor_buffer.lines[row].chars().count());
+        self.editor_state.cursor.row = row;
+        self.editor_state.cursor.col = col;
+    }
+
+    fn sync_after_editor_event(&mut self, before: String) {
+        self.sync_editor_buffer_from_state();
+        if self.editor_buffer.to_text() != before {
+            self.dirty = true;
+            self.last_edit = Some(Instant::now());
+            if self.lints_active {
+                self.run_lints();
+            }
+        }
+    }
+
     fn enter_edit_mode(&mut self) {
         self.mode = Mode::Edit;
-        self.vim_mode = if self.keymap == KeymapPreset::Vim {
-            VimMode::Normal
-        } else {
-            VimMode::Insert
+        self.editor_state.cursor.row = self.editor_buffer.lines.len().saturating_sub(1);
+        self.editor_state.cursor.col = self.editor_buffer.current_line_len();
+        self.editor_state.mode = match self.keymap {
+            KeymapPreset::Default => EditorMode::Insert,
+            KeymapPreset::Vim => EditorMode::Normal,
         };
-        self.editor_buffer.set_cursor_to_end();
-        if self.keymap == KeymapPreset::Vim {
-            self.clamp_cursor_for_vim_normal();
-        }
         self.status = if self.keymap == KeymapPreset::Vim {
             "Edit mode (vim normal)".to_string()
         } else {
             "Edit mode".to_string()
         };
-    }
-
-    fn focus_notes_pane(&mut self) {
-        self.mode = Mode::Normal;
-        self.selection_anchor = None;
-        self.status = "Notes pane".to_string();
+        self.sync_editor_buffer_from_state();
     }
 
     fn active_summary(&self) -> Option<&NoteSummary> {
         self.notes.get(self.selected)
-    }
-
-    fn enter_vim_normal_mode(&mut self, status: &str) {
-        self.vim_mode = VimMode::Normal;
-        self.selection_anchor = None;
-        self.clamp_cursor_for_vim_normal();
-        self.status = status.to_string();
-    }
-
-    fn vim_normal_max_col(&self, row: usize) -> usize {
-        let len = self.editor_buffer.lines[row].chars().count();
-        len.saturating_sub(1)
-    }
-
-    fn clamp_cursor_for_vim_normal(&mut self) {
-        let row = self
-            .editor_buffer
-            .cursor_row
-            .min(self.editor_buffer.lines.len().saturating_sub(1));
-        self.editor_buffer.cursor_row = row;
-
-        let len = self.editor_buffer.lines[row].chars().count();
-        self.editor_buffer.cursor_col = if len == 0 {
-            0
-        } else {
-            self.editor_buffer.cursor_col.min(len.saturating_sub(1))
-        };
-    }
-
-    fn has_char_under_vim_cursor(&self) -> bool {
-        let len = self.editor_buffer.lines[self.editor_buffer.cursor_row]
-            .chars()
-            .count();
-        self.editor_buffer.cursor_col < len
-    }
-
-    fn move_left_for_vim_normal(&mut self) {
-        self.clamp_cursor_for_vim_normal();
-        self.editor_buffer.cursor_col = self.editor_buffer.cursor_col.saturating_sub(1);
-    }
-
-    fn move_right_for_vim_normal(&mut self) {
-        self.clamp_cursor_for_vim_normal();
-        let max_col = self.vim_normal_max_col(self.editor_buffer.cursor_row);
-        self.editor_buffer.cursor_col = self.editor_buffer.cursor_col.min(max_col);
-        if self.editor_buffer.cursor_col < max_col {
-            self.editor_buffer.cursor_col += 1;
-        }
-    }
-
-    fn move_right_for_vim_append(&mut self) {
-        let len = self.editor_buffer.lines[self.editor_buffer.cursor_row]
-            .chars()
-            .count();
-        if len == 0 {
-            self.editor_buffer.cursor_col = 0;
-            return;
-        }
-
-        self.clamp_cursor_for_vim_normal();
-        self.editor_buffer.cursor_col = (self.editor_buffer.cursor_col + 1).min(len);
-    }
-
-    fn move_up_for_vim_normal(&mut self) {
-        self.move_visual_up();
-        self.clamp_cursor_for_vim_normal();
-    }
-
-    fn move_down_for_vim_normal(&mut self) {
-        self.move_visual_down();
-        self.clamp_cursor_for_vim_normal();
     }
 
     fn normal_is_down(&self, key: &KeyEvent) -> bool {
@@ -750,8 +802,18 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.code == KeyCode::Char('?') {
+            self.mode = Mode::Help;
+            return Ok(false);
+        }
+
         if key.code == KeyCode::Char('q') {
             return Ok(true);
+        }
+
+        if key.code == KeyCode::Char('\\') {
+            self.notes_pane_collapsed = !self.notes_pane_collapsed;
+            return Ok(false);
         }
 
         if self.keymap == KeymapPreset::Vim && key.code == KeyCode::Char('l') {
@@ -762,20 +824,33 @@ impl App {
             return Ok(false);
         }
 
-        if self.normal_is_down(&key) {
-            if self.selected + 1 < self.notes.len() {
-                self.selected += 1;
-                self.load_selected()?;
+        if self.notes_pane_collapsed {
+            if self.normal_is_down(&key) || key.code == KeyCode::PageDown {
+                let step: u16 = if key.code == KeyCode::PageDown { 20 } else { 1 };
+                self.preview_scroll = self.preview_scroll.saturating_add(step);
+                return Ok(false);
             }
-            return Ok(false);
-        }
+            if self.normal_is_up(&key) || key.code == KeyCode::PageUp {
+                let step: u16 = if key.code == KeyCode::PageUp { 20 } else { 1 };
+                self.preview_scroll = self.preview_scroll.saturating_sub(step);
+                return Ok(false);
+            }
+        } else {
+            if self.normal_is_down(&key) {
+                if self.selected + 1 < self.notes.len() {
+                    self.selected += 1;
+                    self.load_selected()?;
+                }
+                return Ok(false);
+            }
 
-        if self.normal_is_up(&key) {
-            if self.selected > 0 {
-                self.selected -= 1;
-                self.load_selected()?;
+            if self.normal_is_up(&key) {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                    self.load_selected()?;
+                }
+                return Ok(false);
             }
-            return Ok(false);
         }
 
         match key.code {
@@ -831,54 +906,87 @@ impl App {
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent) -> Result<bool> {
+        // Ctrl+S: save and stay in edit mode
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             self.save_active_note()?;
-            self.mode = Mode::Normal;
             self.status = "Saved".to_string();
             return Ok(false);
         }
 
+        // Ctrl+F: find within note (default keymap only; vim uses edtui's / search)
+        if is_ctrl_char(&key, 'f') && self.keymap == KeymapPreset::Default {
+            self.find_query.clear();
+            self.find_matches.clear();
+            self.find_cursor = 0;
+            self.find_committed = false;
+            self.mode = Mode::Find;
+            self.status = "Find:  type to search  Esc cancel".to_string();
+            return Ok(false);
+        }
+
+        // Ctrl+L: lint (both keymaps)
         if is_ctrl_char(&key, 'l') {
             self.run_lints();
             self.lints_active = true;
             return Ok(false);
         }
 
-        // Selection / clipboard shortcuts (all keymaps)
-        if is_ctrl_char(&key, 'c') {
-            self.copy_selection();
-            self.selection_anchor = None;
-            return Ok(false);
-        }
-        if is_ctrl_char(&key, 'x') {
-            self.push_undo();
-            self.copy_selection();
-            self.delete_selection();
-            return Ok(false);
-        }
-        if is_ctrl_char(&key, 'v') {
-            self.push_undo();
-            self.delete_selection();
-            let sys = self.clipboard_get().filter(|s| !s.is_empty());
-            let text = sys.unwrap_or_else(|| self.yank_buffer.clone());
-            if !text.is_empty() {
-                self.editor_buffer.insert_pasted_str(&text);
+        // Tab: lint fix or 4 spaces (both keymaps)
+        if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+            if let Some(idx) = self.lint_index_at_cursor() {
+                self.push_undo();
+                self.apply_lint_fix(idx);
+            } else if self.keymap == KeymapPreset::Vim {
+                for _ in 0..4 {
+                    InsertChar(' ').execute(&mut self.editor_state);
+                }
+                self.sync_editor_buffer_from_state();
+                self.dirty = true;
+                self.last_edit = Some(Instant::now());
+                if self.lints_active {
+                    self.run_lints();
+                }
+            } else {
+                self.push_undo();
+                self.delete_selection();
+                self.editor_buffer.insert_str("    ");
                 self.dirty = true;
                 self.last_edit = Some(Instant::now());
             }
             return Ok(false);
         }
-        if is_ctrl_char(&key, 'a') {
-            self.selection_anchor = Some(0);
-            let text = self.editor_buffer.to_text();
-            let total = text.chars().count();
-            let (row, col) = Self::char_offset_to_pos(&text, total);
-            self.editor_buffer.cursor_row = row.min(self.editor_buffer.lines.len().saturating_sub(1));
-            self.editor_buffer.cursor_col =
-                col.min(self.editor_buffer.lines[self.editor_buffer.cursor_row].chars().count());
+
+        // Lint jumps (both keymaps)
+        if key.code == KeyCode::Char(']') && self.lints_active {
+            self.selection_anchor = None;
+            if let Some(off) = self.next_lint_offset() {
+                self.jump_to_flat_offset(off);
+                self.sync_cursor_to_state();
+            }
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('[') && self.lints_active {
+            self.selection_anchor = None;
+            if let Some(off) = self.prev_lint_offset() {
+                self.jump_to_flat_offset(off);
+                self.sync_cursor_to_state();
+            }
             return Ok(false);
         }
 
+        match self.keymap {
+            KeymapPreset::Default => self.handle_edit_key_default(key),
+            KeymapPreset::Vim => self.handle_edit_key_vim_edtui(key),
+        }
+    }
+
+    fn handle_edit_key_default(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.code == KeyCode::Esc {
+            self.mode = Mode::Normal;
+            self.selection_anchor = None;
+            self.status = "Normal mode".to_string();
+            return Ok(false);
+        }
         if is_ctrl_char(&key, 'z') {
             if let Some(snapshot) = self.undo_stack.pop() {
                 self.redo_stack.push(self.editor_buffer.clone());
@@ -899,358 +1007,79 @@ impl App {
             }
             return Ok(false);
         }
-
-        if self.keymap == KeymapPreset::Vim {
-            return self.handle_edit_key_vim(key);
+        if is_ctrl_char(&key, 'a') {
+            self.selection_anchor = Some(0);
+            let text = self.editor_buffer.to_text();
+            let total = text.chars().count();
+            let (row, col) = Self::char_offset_to_pos(&text, total);
+            self.editor_buffer.cursor_row = row.min(self.editor_buffer.lines.len().saturating_sub(1));
+            self.editor_buffer.cursor_col =
+                col.min(self.editor_buffer.lines[self.editor_buffer.cursor_row].chars().count());
+            return Ok(false);
         }
+        if is_ctrl_char(&key, 'c') {
+            self.copy_selection();
+            self.selection_anchor = None;
+            return Ok(false);
+        }
+        if is_ctrl_char(&key, 'x') {
+            self.copy_selection();
+            self.push_undo();
+            self.delete_selection();
+            return Ok(false);
+        }
+        if is_ctrl_char(&key, 'v') {
+            self.push_undo();
+            self.delete_selection();
+            let sys = self.clipboard_get().filter(|s| !s.is_empty());
+            let text = sys.unwrap_or_else(|| self.yank_buffer.clone());
+            if !text.is_empty() {
+                self.editor_buffer.insert_pasted_str(&text);
+                self.dirty = true;
+                self.last_edit = Some(Instant::now());
+            }
+            return Ok(false);
+        }
+        self.apply_insert_key(key);
+        Ok(false)
+    }
 
-        if key.code == KeyCode::Esc {
+    fn handle_edit_key_vim_edtui(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.editor_state.mode == EditorMode::Normal && key.code == KeyCode::Esc {
             self.mode = Mode::Normal;
             self.selection_anchor = None;
             self.status = "Normal mode".to_string();
             return Ok(false);
         }
 
-        if key.code == KeyCode::Char(']') && self.lints_active {
-            self.selection_anchor = None;
-            if let Some(off) = self.next_lint_offset() {
-                self.jump_to_flat_offset(off);
+        // p/P in normal mode: prefer system clipboard over edtui's internal yank buffer
+        if self.editor_state.mode == EditorMode::Normal
+            && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+            && key.modifiers.is_empty()
+        {
+            let sys = self.clipboard_get().filter(|s| !s.is_empty());
+            if let Some(text) = sys {
+                use edtui::actions::MoveForward;
+                let before = self.editor_state.lines.to_string();
+                if key.code == KeyCode::Char('p') {
+                    // paste after cursor: advance one then insert
+                    MoveForward(1).execute(&mut self.editor_state);
+                }
+                for c in text.chars() {
+                    InsertChar(c).execute(&mut self.editor_state);
+                }
+                self.sync_after_editor_event(before);
+                return Ok(false);
             }
-            return Ok(false);
-        }
-        if key.code == KeyCode::Char('[') && self.lints_active {
-            self.selection_anchor = None;
-            if let Some(off) = self.prev_lint_offset() {
-                self.jump_to_flat_offset(off);
-            }
-            return Ok(false);
+            // no system clipboard content — fall through to edtui's p (uses its own yank)
         }
 
-        self.apply_insert_key(key);
+        let before = self.editor_state.lines.to_string();
+        self.editor_events.on_key_event(key, &mut self.editor_state);
+        self.sync_after_editor_event(before);
         Ok(false)
     }
 
-    fn handle_edit_key_vim(&mut self, key: KeyEvent) -> Result<bool> {
-        match self.vim_mode {
-            VimMode::Insert => {
-                if key.code == KeyCode::Esc {
-                    self.enter_vim_normal_mode("VIM NORMAL");
-                    return Ok(false);
-                }
-                self.apply_insert_key(key);
-                Ok(false)
-            }
-            VimMode::Normal => {
-                if key.code == KeyCode::Esc {
-                    self.status = "VIM NORMAL  (:w save  :wq quit  Ctrl+S save & exit)".to_string();
-                    return Ok(false);
-                }
-
-                match key.code {
-                    KeyCode::Char(':') => {
-                        self.mode = Mode::Command;
-                        self.command_input.clear();
-                    }
-                    KeyCode::Char('/') => {
-                        self.mode = Mode::Search;
-                        self.search_input = self.query.clone();
-                    }
-                    KeyCode::Char('i') => {
-                        self.clamp_cursor_for_vim_normal();
-                        self.vim_mode = VimMode::Insert;
-                        self.status = "VIM INSERT".to_string();
-                    }
-                    KeyCode::Char('a') => {
-                        self.clamp_cursor_for_vim_normal();
-                        self.move_right_for_vim_append();
-                        self.vim_mode = VimMode::Insert;
-                        self.status = "VIM INSERT".to_string();
-                    }
-                    KeyCode::Char('I') => {
-                        self.editor_buffer.move_home();
-                        self.vim_mode = VimMode::Insert;
-                        self.status = "VIM INSERT".to_string();
-                    }
-                    KeyCode::Char('A') => {
-                        self.editor_buffer.move_end();
-                        self.vim_mode = VimMode::Insert;
-                        self.status = "VIM INSERT".to_string();
-                    }
-                    KeyCode::Char('o') => {
-                        self.editor_buffer.open_line_below();
-                        self.vim_mode = VimMode::Insert;
-                        self.status = "VIM INSERT".to_string();
-                        self.dirty = true;
-                        self.last_edit = Some(Instant::now());
-                    }
-                    KeyCode::Char('O') => {
-                        self.editor_buffer.open_line_above();
-                        self.vim_mode = VimMode::Insert;
-                        self.status = "VIM INSERT".to_string();
-                        self.dirty = true;
-                        self.last_edit = Some(Instant::now());
-                    }
-                    // Ctrl+Left/Right: word jump
-                    KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.editor_buffer.move_word_left();
-                    }
-                    KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.selection_anchor = None;
-                        self.editor_buffer.move_word_left();
-                        self.clamp_cursor_for_vim_normal();
-                    }
-                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.editor_buffer.move_word_right();
-                    }
-                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.selection_anchor = None;
-                        self.editor_buffer.move_word_right();
-                        self.clamp_cursor_for_vim_normal();
-                    }
-                    // Ctrl+Home/End: doc start/end
-                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.editor_buffer.cursor_row = 0;
-                        self.editor_buffer.cursor_col = 0;
-                    }
-                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.selection_anchor = None;
-                        self.editor_buffer.cursor_row = 0;
-                        self.editor_buffer.cursor_col = 0;
-                    }
-                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.editor_buffer.set_cursor_to_end();
-                    }
-                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.selection_anchor = None;
-                        self.editor_buffer.set_cursor_to_end();
-                    }
-                    // PageUp/PageDown
-                    KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.move_page_down();
-                    }
-                    KeyCode::PageDown => {
-                        self.selection_anchor = None;
-                        self.move_page_down();
-                    }
-                    KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.move_page_up();
-                    }
-                    KeyCode::PageUp => {
-                        self.selection_anchor = None;
-                        self.move_page_up();
-                    }
-                    // Shift+Home/End: extend selection
-                    KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.editor_buffer.move_home();
-                    }
-                    KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.editor_buffer.move_end();
-                    }
-                    // Shift+arrows: extend selection
-                    KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.editor_buffer.move_left();
-                    }
-                    KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.editor_buffer.move_right();
-                    }
-                    KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.move_visual_up();
-                    }
-                    KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_flat_offset());
-                        }
-                        self.move_visual_down();
-                    }
-                    // Bare movements: clear selection
-                    KeyCode::Char('h') | KeyCode::Left => {
-                        self.selection_anchor = None;
-                        if self.editor_buffer.cursor_col == 0 {
-                            self.focus_notes_pane();
-                        } else {
-                            self.move_left_for_vim_normal();
-                        }
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        self.selection_anchor = None;
-                        self.move_down_for_vim_normal();
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        self.selection_anchor = None;
-                        self.move_up_for_vim_normal();
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        self.selection_anchor = None;
-                        self.move_right_for_vim_normal();
-                    }
-                    KeyCode::Char('0') | KeyCode::Home => {
-                        self.selection_anchor = None;
-                        self.editor_buffer.move_home();
-                    }
-                    KeyCode::Char('$') | KeyCode::End => {
-                        self.selection_anchor = None;
-                        self.editor_buffer.move_end();
-                    }
-                    KeyCode::Char('x') | KeyCode::Delete => {
-                        if !self.delete_selection() && self.has_char_under_vim_cursor() {
-                            self.editor_buffer.delete();
-                            self.dirty = true;
-                            self.last_edit = Some(Instant::now());
-                        }
-                    }
-                    KeyCode::Char(']') => {
-                        if self.lints_active {
-                            self.selection_anchor = None;
-                            if let Some(off) = self.next_lint_offset() {
-                                self.jump_to_flat_offset(off);
-                            }
-                        }
-                    }
-                    KeyCode::Char('[') => {
-                        if self.lints_active {
-                            self.selection_anchor = None;
-                            if let Some(off) = self.prev_lint_offset() {
-                                self.jump_to_flat_offset(off);
-                            }
-                        }
-                    }
-                    // v: enter Visual selection mode
-                    KeyCode::Char('v') => {
-                        self.selection_anchor = Some(self.cursor_flat_offset());
-                        self.vim_mode = VimMode::Visual;
-                        self.status = "-- VISUAL --".to_string();
-                    }
-                    // y: yank selection (or current line if no selection)
-                    KeyCode::Char('y') => {
-                        if self.selection_anchor.is_some() {
-                            self.copy_selection();
-                            self.selection_anchor = None;
-                        } else {
-                            // yank current line
-                            let line = self.editor_buffer.lines[self.editor_buffer.cursor_row].clone();
-                            let yanked = line + "\n";
-                            self.yank_buffer = yanked.clone();
-                            self.clipboard_set(&yanked);
-                        }
-                    }
-                    // p: paste at cursor (char-wise) or below line (line-wise)
-                    KeyCode::Char('p') => {
-                        self.selection_anchor = None;
-                        let sys = self.clipboard_get().filter(|s| !s.is_empty());
-                        let text = sys.unwrap_or_else(|| self.yank_buffer.clone());
-                        if !text.is_empty() {
-                            if text.ends_with('\n') {
-                                // line-wise: open new line below and paste
-                                self.editor_buffer.move_end();
-                                self.editor_buffer.insert_newline();
-                                let content = text.trim_end_matches('\n').to_string();
-                                self.editor_buffer.insert_pasted_str(&content);
-                            } else {
-                                self.move_right_for_vim_append();
-                                self.editor_buffer.insert_pasted_str(&text);
-                            }
-                            self.dirty = true;
-                            self.last_edit = Some(Instant::now());
-                        }
-                    }
-                    KeyCode::Char('P') => {
-                        self.selection_anchor = None;
-                        let sys = self.clipboard_get().filter(|s| !s.is_empty());
-                        let text = sys.unwrap_or_else(|| self.yank_buffer.clone());
-                        if !text.is_empty() {
-                            if text.ends_with('\n') {
-                                // line-wise: paste above current line
-                                self.editor_buffer.move_home();
-                                let content = text.trim_end_matches('\n').to_string();
-                                self.editor_buffer.insert_pasted_str(&content);
-                                self.editor_buffer.insert_newline();
-                                // move cursor back up to the pasted content
-                                self.move_visual_up();
-                            } else {
-                                self.editor_buffer.insert_pasted_str(&text);
-                            }
-                            self.dirty = true;
-                            self.last_edit = Some(Instant::now());
-                        }
-                    }
-                    // d: delete selection (no-op if no selection)
-                    KeyCode::Char('d') => {
-                        self.delete_selection();
-                    }
-                    _ => {}
-                }
-                Ok(false)
-            }
-            VimMode::Visual => {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('v') => {
-                        self.enter_vim_normal_mode("VIM NORMAL");
-                    }
-                    // Movements extend selection (do NOT clear anchor)
-                    KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => self.editor_buffer.move_word_left(),
-                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => self.editor_buffer.move_word_right(),
-                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.editor_buffer.cursor_row = 0;
-                        self.editor_buffer.cursor_col = 0;
-                    }
-                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => self.editor_buffer.set_cursor_to_end(),
-                    KeyCode::PageDown => self.move_page_down(),
-                    KeyCode::PageUp => self.move_page_up(),
-                    KeyCode::Char('h') | KeyCode::Left => self.editor_buffer.move_left(),
-                    KeyCode::Char('j') | KeyCode::Down => self.move_visual_down(),
-                    KeyCode::Char('k') | KeyCode::Up => self.move_visual_up(),
-                    KeyCode::Char('l') | KeyCode::Right => self.editor_buffer.move_right(),
-                    KeyCode::Char('0') | KeyCode::Home => self.editor_buffer.move_home(),
-                    KeyCode::Char('$') | KeyCode::End => self.editor_buffer.move_end(),
-                    // y: yank and exit Visual
-                    KeyCode::Char('y') => {
-                        self.copy_selection();
-                        self.enter_vim_normal_mode("VIM NORMAL");
-                    }
-                    // d/x: delete selection and exit Visual
-                    KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
-                        self.delete_selection();
-                        self.enter_vim_normal_mode("VIM NORMAL");
-                    }
-                    _ => {}
-                }
-                Ok(false)
-            }
-        }
-    }
 
     fn apply_insert_key(&mut self, key: KeyEvent) {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -1423,6 +1252,167 @@ impl App {
         Ok(false)
     }
 
+    fn handle_find_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.code == KeyCode::Esc {
+            self.find_matches.clear();
+            self.find_committed = false;
+            self.mode = Mode::Edit;
+            self.status = "Find closed".to_string();
+            return Ok(false);
+        }
+
+        if self.find_committed {
+            // Navigation phase
+            match key.code {
+                KeyCode::Enter => {
+                    // Confirm position — drop into edit mode at the active match
+                    self.find_matches.clear();
+                    self.find_committed = false;
+                    self.mode = Mode::Edit;
+                    self.status = "Edit mode".to_string();
+                }
+                KeyCode::Down | KeyCode::Char('n') => {
+                    if !self.find_matches.is_empty() {
+                        self.find_cursor = (self.find_cursor + 1) % self.find_matches.len();
+                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                        self.update_find_status();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('N') => {
+                    if !self.find_matches.is_empty() {
+                        self.find_cursor = if self.find_cursor == 0 {
+                            self.find_matches.len() - 1
+                        } else {
+                            self.find_cursor - 1
+                        };
+                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                        self.update_find_status();
+                    }
+                }
+                KeyCode::Backspace => {
+                    // Drop back to typing phase
+                    self.find_committed = false;
+                    self.find_query.pop();
+                    self.run_find();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    // Any printable char restarts typing phase with that char
+                    self.find_committed = false;
+                    self.find_query.clear();
+                    self.find_query.push(c);
+                    self.run_find();
+                }
+                _ => {}
+            }
+        } else {
+            // Typing phase
+            match key.code {
+                KeyCode::Enter | KeyCode::Tab => {
+                    if !self.find_matches.is_empty() {
+                        self.find_committed = true;
+                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                        self.update_find_status();
+                    }
+                }
+                KeyCode::Down => {
+                    if !self.find_matches.is_empty() {
+                        self.find_cursor = (self.find_cursor + 1) % self.find_matches.len();
+                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                        self.update_find_status();
+                    }
+                }
+                KeyCode::Up => {
+                    if !self.find_matches.is_empty() {
+                        self.find_cursor = if self.find_cursor == 0 {
+                            self.find_matches.len() - 1
+                        } else {
+                            self.find_cursor - 1
+                        };
+                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                        self.update_find_status();
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.find_query.pop();
+                    self.run_find();
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.find_query.push(c);
+                    self.run_find();
+                }
+                _ => {}
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn update_find_status(&mut self) {
+        if self.find_matches.is_empty() {
+            self.status = format!("Find: {}  [no matches]", self.find_query);
+        } else if self.find_committed {
+            self.status = format!(
+                "Find: {}  [{}/{}]  n/↓ next  N/↑ prev  Enter edit here  Esc close",
+                self.find_query,
+                self.find_cursor + 1,
+                self.find_matches.len(),
+            );
+        } else {
+            self.status = format!(
+                "Find: {}  [{} matches]  Enter confirm  Esc cancel",
+                self.find_query,
+                self.find_matches.len(),
+            );
+        }
+    }
+
+    fn run_find(&mut self) {
+        self.find_matches.clear();
+        self.find_cursor = 0;
+        if self.find_query.is_empty() {
+            self.status = "Find: ".to_string();
+            return;
+        }
+        let flat = self.editor_buffer.to_text();
+        let query_lower = self.find_query.to_ascii_lowercase();
+        let flat_lower = flat.to_ascii_lowercase();
+        let chars: Vec<char> = flat_lower.chars().collect();
+        let qchars: Vec<char> = query_lower.chars().collect();
+        let qlen = qchars.len();
+        if qlen == 0 {
+            return;
+        }
+        let n = chars.len();
+        for i in 0..=n.saturating_sub(qlen) {
+            if chars[i..i + qlen] == qchars[..] {
+                self.find_matches.push(i);
+            }
+        }
+        if !self.find_matches.is_empty() {
+            // jump to nearest match from current cursor position
+            let cur = self.cursor_flat_offset();
+            let nearest = self
+                .find_matches
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &off)| {
+                    let d = if off >= cur { off - cur } else { cur - off };
+                    d
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.find_cursor = nearest;
+            self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+        }
+        self.update_find_status();
+    }
+
     fn handle_command_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc => {
@@ -1462,7 +1452,6 @@ impl App {
             "q" | "quit" => return Ok(true),
             "w" => {
                 self.save_active_note()?;
-                self.mode = Mode::Normal;
                 self.status = "Saved".to_string();
             }
             "wq" | "x" => {
@@ -1515,24 +1504,11 @@ impl App {
                 let arg = parts.next().unwrap_or("");
                 if let Some(keymap) = KeymapPreset::from_label(arg) {
                     self.keymap = keymap;
+                    self.apply_editor_keymap();
                     self.persist_preferences();
                     self.status = format!("Keymap -> {}", keymap.label());
                 } else {
                     self.status = "Usage: :keymap default|vim".to_string();
-                }
-            }
-            "density" => {
-                let arg = parts.next().unwrap_or("");
-                if arg.eq_ignore_ascii_case("toggle") {
-                    self.density = self.density.toggle();
-                    self.persist_preferences();
-                    self.status = format!("Density -> {}", self.density.label());
-                } else if let Some(density) = Density::from_label(arg) {
-                    self.density = density;
-                    self.persist_preferences();
-                    self.status = format!("Density -> {}", density.label());
-                } else {
-                    self.status = "Usage: :density cozy|compact|toggle".to_string();
                 }
             }
             "folder" => {
@@ -1550,9 +1526,50 @@ impl App {
                     self.status = "No active note".to_string();
                 }
             }
+            "pin" => {
+                if let Some(id) = self.active_note_id {
+                    self.store.set_pinned(id, true)?;
+                    self.refresh_notes()?;
+                    self.select_by_id(id);
+                    self.status = "Note pinned".to_string();
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
+            "unpin" => {
+                if let Some(id) = self.active_note_id {
+                    self.store.set_pinned(id, false)?;
+                    self.refresh_notes()?;
+                    self.select_by_id(id);
+                    self.status = "Note unpinned".to_string();
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
+            "archive" => {
+                if let Some(id) = self.active_note_id {
+                    self.store.set_archived(id, true)?;
+                    self.refresh_notes()?;
+                    self.selected = self.selected.min(self.notes.len().saturating_sub(1));
+                    self.load_selected()?;
+                    self.status = "Note archived".to_string();
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
+            "unarchive" => {
+                if let Some(id) = self.active_note_id {
+                    self.store.set_archived(id, false)?;
+                    self.refresh_notes()?;
+                    self.select_by_id(id);
+                    self.status = "Note unarchived".to_string();
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
             "help" => {
                 self.status =
-                    "Commands: :new :edit :search <q> :folder [name] :theme :keymap :density :reload :quit"
+                    "Commands: :new :edit :search <q> :folder :pin :unpin :archive :unarchive :theme :keymap :reload :quit"
                         .to_string();
             }
             _ => {
@@ -1576,6 +1593,7 @@ impl App {
             self.selected = 0;
             self.active_note_id = None;
             self.editor_buffer = EditorBuffer::new();
+            self.sync_state_from_editor_buffer();
             self.dirty = false;
         } else if self.selected >= self.notes.len() {
             self.selected = self.notes.len() - 1;
@@ -1588,16 +1606,21 @@ impl App {
             self.active_note_id = Some(note.id);
             if let Some(full) = self.store.get_note(note.id)? {
                 self.editor_buffer = EditorBuffer::from_text(full.body);
+                self.sync_state_from_editor_buffer();
                 self.dirty = false;
             }
         } else {
             self.active_note_id = None;
             self.editor_buffer = EditorBuffer::new();
+            self.sync_state_from_editor_buffer();
             self.dirty = false;
         }
         self.lints.clear();
         self.lints_active = false;
         self.selection_anchor = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.preview_scroll = 0;
         Ok(())
     }
 
@@ -1606,7 +1629,11 @@ impl App {
             self.store.update_note(id, &self.editor_buffer.to_text())?;
             self.refresh_notes()?;
             self.select_by_id(id);
-            self.load_selected()?;
+            if self.mode == Mode::Edit {
+                self.dirty = false;
+            } else {
+                self.load_selected()?;
+            }
         }
         Ok(())
     }
@@ -1625,12 +1652,57 @@ impl App {
 
     fn clipboard_set(&mut self, text: &str) {
         if let Some(cb) = self.clipboard.as_mut() {
-            let _ = cb.set_text(text);
+            if cb.set_text(text).is_ok() {
+                return;
+            }
         }
+        // Fallback: shell clipboard tools
+        let _ = std::process::Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.as_mut().map(|s| s.write_all(text.as_bytes()));
+                c.wait()
+            });
+        let _ = std::process::Command::new("xclip")
+            .args(["-sel", "clip"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.as_mut().map(|s| s.write_all(text.as_bytes()));
+                c.wait()
+            });
     }
 
     fn clipboard_get(&mut self) -> Option<String> {
-        self.clipboard.as_mut()?.get_text().ok()
+        if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+            return Some(text);
+        }
+        // Fallback: shell clipboard tools
+        if let Ok(out) = std::process::Command::new("wl-paste").arg("--no-newline").output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    return Some(s);
+                }
+            }
+        }
+        if let Ok(out) = std::process::Command::new("xclip").args(["-sel", "clip", "-o"]).output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    return Some(s);
+                }
+            }
+        }
+        if let Ok(out) = std::process::Command::new("xsel").arg("--clipboard").arg("--output").output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    return Some(s);
+                }
+            }
+        }
+        None
     }
 
     fn char_offset_to_pos(text: &str, offset: usize) -> (usize, usize) {
@@ -1686,8 +1758,10 @@ impl App {
         let new_text: String = new_chars.into_iter().collect();
         let (row, col) = Self::char_offset_to_pos(&new_text, span_start);
         self.editor_buffer = EditorBuffer::from_text(new_text);
-        self.editor_buffer.cursor_row = row;
-        self.editor_buffer.cursor_col = col;
+        self.editor_buffer.cursor_row = row.min(self.editor_buffer.lines.len().saturating_sub(1));
+        self.editor_buffer.cursor_col =
+            col.min(self.editor_buffer.lines[self.editor_buffer.cursor_row].chars().count());
+        self.sync_state_from_editor_buffer();
         self.dirty = true;
         self.run_lints();
     }
@@ -1769,6 +1843,7 @@ impl App {
         new_buf.cursor_row = row.min(new_buf.lines.len().saturating_sub(1));
         new_buf.cursor_col = col.min(new_buf.lines[new_buf.cursor_row].chars().count());
         self.editor_buffer = new_buf;
+        self.sync_state_from_editor_buffer();
         self.dirty = true;
         self.last_edit = Some(Instant::now());
         true
@@ -1858,6 +1933,86 @@ impl App {
         }
     }
 
+    fn compute_syntax_highlights(&self, palette: Palette) -> Vec<Vec<(usize, usize, Style)>> {
+        let theme = self.theme_set.themes.get("base16-ocean.dark")
+            .or_else(|| self.theme_set.themes.values().next());
+        let Some(theme) = theme else {
+            return self.editor_buffer.lines.iter().map(|_| vec![]).collect();
+        };
+
+        let mut result: Vec<Vec<(usize, usize, Style)>> = Vec::new();
+        let mut in_code_block = false;
+        let mut highlighter: Option<HighlightLines> = None;
+
+        for line in &self.editor_buffer.lines {
+            let trimmed = line.trim_end();
+
+            if !in_code_block {
+                // Check for opening fence
+                if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                    let fence_char = if trimmed.starts_with("```") { "```" } else { "~~~" };
+                    let lang = trimmed.trim_start_matches(fence_char).trim();
+                    let syntax = if lang.is_empty() {
+                        self.syntax_set.find_syntax_plain_text()
+                    } else {
+                        self.syntax_set.find_syntax_by_token(lang)
+                            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text())
+                    };
+                    highlighter = Some(HighlightLines::new(syntax, theme));
+                    in_code_block = true;
+
+                    // Style the fence line as muted
+                    let muted_style = Style::default().fg(palette.muted);
+                    let len = line.chars().count();
+                    let row_ranges = if len > 0 { vec![(0, len, muted_style)] } else { vec![] };
+                    result.push(row_ranges);
+                    continue;
+                }
+
+                // Normal markdown line
+                let row_ranges = markdown_highlight_line(line, palette);
+                result.push(row_ranges);
+            } else {
+                // Inside a code block
+                // Check for closing fence
+                if trimmed == "```" || trimmed == "~~~" {
+                    in_code_block = false;
+                    highlighter = None;
+
+                    let muted_style = Style::default().fg(palette.muted);
+                    let len = line.chars().count();
+                    let row_ranges = if len > 0 { vec![(0, len, muted_style)] } else { vec![] };
+                    result.push(row_ranges);
+                    continue;
+                }
+
+                // Highlighted code line
+                let mut row_ranges: Vec<(usize, usize, Style)> = Vec::new();
+                if let Some(hl) = highlighter.as_mut() {
+                    let line_with_newline = format!("{}\n", line);
+                    if let Ok(tokens) = hl.highlight_line(&line_with_newline, &self.syntax_set) {
+                        let mut col: usize = 0;
+                        for (syntect_style, token_str) in &tokens {
+                            let char_count = token_str.chars().count();
+                            // Strip trailing newline from last token
+                            let visible_chars = token_str.trim_end_matches('\n').chars().count();
+                            if visible_chars > 0 {
+                                let fg = syntect_style.foreground;
+                                let ratatui_color = Color::Rgb(fg.r, fg.g, fg.b);
+                                let style = Style::default().fg(ratatui_color);
+                                row_ranges.push((col, col + visible_chars, style));
+                            }
+                            col += char_count;
+                        }
+                    }
+                }
+                result.push(row_ranges);
+            }
+        }
+
+        result
+    }
+
     fn editor_view(&self, area: Rect, palette: Palette) -> (Text<'static>, u16, u16, u16) {
         if area.width == 0 || area.height == 0 {
             return (Text::default(), area.x, area.y, 0);
@@ -1906,6 +2061,34 @@ impl App {
             .fg(palette.danger)
             .add_modifier(Modifier::UNDERLINED);
         let sel_style = Style::default().bg(palette.accent).fg(palette.bg);
+        let find_style = Style::default().bg(palette.muted).fg(palette.bg);
+        let find_active_style = Style::default().bg(palette.ok).fg(palette.bg).add_modifier(Modifier::BOLD);
+
+        // Pre-compute find match row/col positions
+        let (find_positions, find_active_pos): (Vec<(usize, usize, usize)>, Option<(usize, usize, usize)>) =
+            if !self.find_matches.is_empty() {
+                let text = self.editor_buffer.to_text();
+                let qlen = self.find_query.chars().count();
+                let positions: Vec<(usize, usize, usize)> = self.find_matches
+                    .iter()
+                    .map(|&off| {
+                        let (r, c) = Self::char_offset_to_pos(&text, off);
+                        (r, c, qlen)
+                    })
+                    .collect();
+                let active = positions.get(self.find_cursor).copied();
+                (positions, active)
+            } else {
+                (Vec::new(), None)
+            };
+
+        // Pre-compute syntax highlights (only in edit/find mode)
+        let syntax_highlights: Vec<Vec<(usize, usize, Style)>> =
+            if self.mode == Mode::Edit || self.mode == Mode::Find {
+                self.compute_syntax_highlights(palette)
+            } else {
+                Vec::new()
+            };
 
         let mut all_visual_lines: Vec<Line<'static>> = Vec::new();
         let mut cursor_visual_row = 0usize;
@@ -1966,6 +2149,27 @@ impl App {
             };
             let merged_sel = merge_ranges(sel_ranges);
 
+            // Find match column ranges for this logical row
+            let find_ranges: Vec<(usize, usize)> = find_positions
+                .iter()
+                .filter_map(|&(r, c, qlen)| {
+                    if r == logical_row {
+                        Some((c, c + qlen))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let merged_find = merge_ranges(find_ranges);
+
+            // Active (focused) find match for this row
+            let active_find_range: Vec<(usize, usize)> = match find_active_pos {
+                Some((r, c, qlen)) if r == logical_row => vec![(c, c + qlen)],
+                _ => vec![],
+            };
+
+            let syn_ranges = syntax_highlights.get(logical_row).map(|v| v.as_slice()).unwrap_or(&[]);
+
             for sub_idx in 0..sub_lines {
                 let start_col = sub_idx * width;
                 let end_col = (start_col + width).min(len);
@@ -1979,9 +2183,14 @@ impl App {
                     start_col,
                     &merged_lints,
                     &merged_sel,
+                    &merged_find,
+                    &active_find_range,
+                    syn_ranges,
                     normal_style,
                     lint_style,
                     sel_style,
+                    find_style,
+                    find_active_style,
                 );
                 all_visual_lines.push(Line::from(spans));
             }
@@ -2129,7 +2338,9 @@ impl App {
         let top = Paragraph::new(top_text);
         frame.render_widget(top, layout[0]);
 
-        let split = if self.density == Density::Compact {
+        let split = if matches!(self.mode, Mode::Edit | Mode::Find) || self.notes_pane_collapsed {
+            [Constraint::Length(0), Constraint::Percentage(100)]
+        } else if self.density == Density::Compact {
             [Constraint::Percentage(30), Constraint::Percentage(70)]
         } else {
             [Constraint::Percentage(34), Constraint::Percentage(66)]
@@ -2153,6 +2364,21 @@ impl App {
                     let ts = short_timestamp(&n.updated_at);
                     let selected_row = idx == self.selected;
                     let mut spans: Vec<TSpan<'static>> = Vec::new();
+
+                    if n.pinned {
+                        spans.push(if selected_row {
+                            TSpan::styled("* ", Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD))
+                        } else {
+                            TSpan::styled("* ", Style::default().fg(palette.ok).add_modifier(Modifier::BOLD))
+                        });
+                    }
+                    if n.archived {
+                        spans.push(if selected_row {
+                            TSpan::styled("[arch] ", Style::default().bg(palette.accent).fg(palette.bg))
+                        } else {
+                            TSpan::styled("[arch] ", Style::default().fg(palette.muted))
+                        });
+                    }
 
                     if !n.folder.is_empty() {
                         let folder_text = format!("{}/", n.folder);
@@ -2230,7 +2456,9 @@ impl App {
             .title(" Notes ")
             .style(Style::default().bg(palette.panel).fg(palette.text))
             .border_style(Style::default().fg(list_border_color));
-        frame.render_widget(List::new(list_items).block(list_block), main[0]);
+        if self.mode != Mode::Edit {
+            frame.render_widget(List::new(list_items).block(list_block), main[0]);
+        }
 
         let meta_base = Style::default()
             .bg(palette.panel)
@@ -2266,18 +2494,20 @@ impl App {
 
         let editor_title = match self.mode {
             Mode::Normal => " Preview ",
-            Mode::Edit if self.keymap == KeymapPreset::Vim && self.vim_mode == VimMode::Normal => {
+            Mode::Edit if self.keymap == KeymapPreset::Vim && self.editor_state.mode == EditorMode::Normal => {
                 " Edit (vim normal) "
             }
-            Mode::Edit if self.keymap == KeymapPreset::Vim && self.vim_mode == VimMode::Insert => {
+            Mode::Edit if self.keymap == KeymapPreset::Vim && self.editor_state.mode == EditorMode::Insert => {
                 " Edit (vim insert) "
             }
-            Mode::Edit if self.keymap == KeymapPreset::Vim && self.vim_mode == VimMode::Visual => {
+            Mode::Edit if self.keymap == KeymapPreset::Vim && self.editor_state.mode == EditorMode::Visual => {
                 " Edit (vim visual) "
             }
             Mode::Edit => " Edit ",
             Mode::Search => " Preview ",
             Mode::Command => " Preview ",
+            Mode::Find => " Edit (find) ",
+            Mode::Help => " Preview ",
         };
 
         let editor_border_color = if self.mode == Mode::Edit {
@@ -2305,12 +2535,48 @@ impl App {
         let meta = Paragraph::new(active_meta_line);
         frame.render_widget(meta, editor_layout[0]);
 
-        let (editor_text, cursor_x, cursor_y, scroll_y) =
-            self.editor_view(editor_layout[1], palette);
-        let editor = Paragraph::new(editor_text)
-            .style(Style::default().fg(palette.text).bg(palette.panel))
-            .scroll((scroll_y, 0));
-        frame.render_widget(editor, editor_layout[1]);
+        let mut cursor_x = editor_layout[1].x;
+        let mut cursor_y = editor_layout[1].y;
+
+        if self.mode == Mode::Edit && self.keymap == KeymapPreset::Vim {
+            let editor_theme = EditorTheme::default()
+                .base(Style::default().fg(palette.text).bg(palette.panel))
+                .selection_style(Style::default().fg(palette.bg).bg(palette.ok))
+                .line_numbers_style(Style::default().fg(palette.muted).bg(palette.panel))
+                .hide_cursor()
+                .hide_status_line();
+            EditorView::new(&mut self.editor_state)
+                .theme(editor_theme)
+                .wrap(false)
+                .tab_width(EditorBuffer::TAB_WIDTH)
+                .line_numbers(LineNumbers::Absolute)
+                .render(editor_layout[1], frame.buffer_mut());
+            if let Some(pos) = self.editor_state.cursor_screen_position() {
+                cursor_x = pos.x;
+                cursor_y = pos.y;
+            }
+        } else if self.mode == Mode::Edit || self.mode == Mode::Find {
+            // Default edit mode: raw buffer view with cursor
+            let (editor_text, preview_x, preview_y, scroll_y) =
+                self.editor_view(editor_layout[1], palette);
+            cursor_x = preview_x;
+            cursor_y = preview_y;
+            let editor = Paragraph::new(editor_text)
+                .style(Style::default().fg(palette.text).bg(palette.panel))
+                .scroll((scroll_y, 0));
+            frame.render_widget(editor, editor_layout[1]);
+        } else {
+            // Normal/Search/Command mode: markdown preview
+            let md_text = render_markdown_preview(
+                &self.editor_buffer.to_text(),
+                palette,
+                editor_layout[1].width as usize,
+            );
+            let preview = Paragraph::new(md_text)
+                .style(Style::default().fg(palette.text).bg(palette.panel))
+                .scroll((self.preview_scroll, 0));
+            frame.render_widget(preview, editor_layout[1]);
+        }
 
         if self.mode == Mode::Edit {
             frame.set_cursor_position((cursor_x, cursor_y));
@@ -2338,6 +2604,8 @@ impl App {
             Mode::Edit => "EDIT",
             Mode::Search => "SEARCH",
             Mode::Command => "COMMAND",
+            Mode::Find => "FIND",
+            Mode::Help => "HELP",
         };
         let dirty_text = if self.dirty { "*" } else { "" };
 
@@ -2354,19 +2622,21 @@ impl App {
         let status_line = match self.mode {
             Mode::Search => format!("/{search}", search = self.search_input),
             Mode::Command => format!(":{}", self.command_input),
-            _ => {
-                let delete_hint = if self.mode == Mode::Normal {
-                    "  n new  d delete"
-                } else {
-                    ""
-                };
+            Mode::Edit | Mode::Find => {
                 format!(
-                    "[{mode}] {status} {dirty} | : command{delete_hint} | F6 theme | F7 keymap | F8 density | q quit{lint_hint}",
+                    "[{mode}] {status} {dirty} | Esc exit | Ctrl+S save | F6 theme | F7 keymap{lint_hint}",
                     mode = mode_text,
                     status = self.status,
                     dirty = dirty_text,
-                    delete_hint = delete_hint,
                     lint_hint = lint_hint,
+                )
+            }
+            _ => {
+                format!(
+                    "[{mode}] {status} {dirty} | : command  n new  d delete  \\ pane | F6 theme | F7 keymap | ? help | q quit",
+                    mode = mode_text,
+                    status = self.status,
+                    dirty = dirty_text,
                 )
             }
         };
@@ -2384,6 +2654,104 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         );
         frame.render_widget(status, layout[2]);
+
+        if self.mode == Mode::Help {
+            self.render_help_overlay(frame, palette);
+        }
+    }
+
+    fn render_help_overlay(&self, frame: &mut Frame, palette: Palette) {
+        let area = frame.area();
+        let w = area.width.min(72);
+        let h = area.height.min(46);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect { x, y, width: w, height: h };
+
+        frame.render_widget(Clear, popup);
+
+        let bold = |s: &str| TSpan::styled(s.to_string(), Style::default().add_modifier(Modifier::BOLD));
+        let dim  = |s: &str| TSpan::styled(s.to_string(), Style::default().fg(palette.muted));
+        let key  = |s: &str| TSpan::styled(s.to_string(), Style::default().fg(palette.accent).add_modifier(Modifier::BOLD));
+        let txt  = |s: &str| TSpan::raw(s.to_string());
+
+        let pad = || Line::raw("");
+
+        let heading = |label: &str| {
+            Line::from(vec![bold(label)])
+        };
+
+        let row2 = |k1: &str, d1: &str, k2: &str, d2: &str| {
+            Line::from(vec![
+                key(&format!("  {:<20}", k1)),
+                txt(&format!("{:<22}", d1)),
+                key(&format!("  {:<16}", k2)),
+                txt(d2),
+            ])
+        };
+
+        let row1 = |k: &str, d: &str| {
+            Line::from(vec![key(&format!("  {:<20}", k)), txt(d)])
+        };
+
+        let lines: Vec<Line> = vec![
+            pad(),
+            heading("  NORMAL MODE"),
+            row2("j / k  ↑↓",    "navigate notes",      "n",       "new note"),
+            row2("Enter / e",     "open note",           "d d",     "delete note"),
+            row2("/",             "search notes",        ":",       "command"),
+            row2("\\",            "toggle notes pane",   "q",       "quit"),
+            pad(),
+            heading("  COLLAPSED PANE  (preview only)"),
+            row2("j / k  ↑↓",    "scroll one line",     "PgDn / PgUp", "scroll fast"),
+            pad(),
+            heading("  EDIT MODE"),
+            row2("Esc",          "exit to preview",     "Ctrl+S",  "save"),
+            row2("Ctrl+F",       "find in note",        "Ctrl+L",  "spell / grammar lint"),
+            row2("Tab",          "apply lint fix",      "] / [",   "next / prev lint"),
+            row2("Ctrl+Z / Y",   "undo / redo",         "Ctrl+C/X","copy / cut"),
+            row1("Ctrl+V",       "paste from clipboard"),
+            pad(),
+            Line::from(vec![bold("  DEFAULT  "), dim("(default keymap only)")]),
+            row2("Ctrl+F",       "find in note",        "Ctrl+A",  "select all"),
+            pad(),
+            Line::from(vec![bold("  VIM  "), dim("(vim keymap only)")]),
+            row2("h j k l",      "move cursor",         "i / a",   "enter insert mode"),
+            row2("v",            "visual select",       "y / d",   "yank / delete"),
+            row2("p / P",        "paste (clipboard)",   "u / Ctrl+R","undo / redo"),
+            pad(),
+            heading("  SEARCH  (/ to enter)"),
+            row2("#tag",         "filter by tag",       "/folder", "filter by folder"),
+            row1(":archived",    "show archived notes"),
+            pad(),
+            heading("  COMMANDS  (: to enter)"),
+            row2(":new",         "create a new note",            ":edit",      "open note in editor"),
+            row2(":folder <name>","move note to folder",          ":pin/:unpin","pin note to top"),
+            row2(":archive",     "hide note from main list",     ":unarchive", "restore archived note"),
+            row2(":search <q>",  "search programmatically",      ":reload",    "refresh note list"),
+            row2(":theme <name>","neo-noir | paper | matrix",    ":keymap",    "default | vim"),
+            pad(),
+            Line::from(vec![
+                dim("  F6 cycle theme   F7 cycle keymap"),
+                txt("                    "),
+                key("? or Esc"),
+                dim(" to close"),
+            ]),
+            pad(),
+        ];
+
+        let block = Block::default()
+            .title(" Help ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.accent))
+            .style(Style::default().bg(palette.bg).fg(palette.text));
+
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let para = Paragraph::new(lines)
+            .style(Style::default().bg(palette.bg).fg(palette.text));
+        frame.render_widget(para, inner);
     }
 }
 
@@ -2418,47 +2786,403 @@ fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     merged
 }
 
+fn markdown_highlight_line(line: &str, palette: Palette) -> Vec<(usize, usize, Style)> {
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    if len == 0 {
+        return vec![];
+    }
+
+    let muted_style = Style::default().fg(palette.muted);
+    let accent_style = Style::default().fg(palette.accent).add_modifier(Modifier::BOLD);
+    let ok_style = Style::default().fg(palette.ok);
+
+    // Headings: starts with one or more '#' followed by a space
+    let heading_level: usize = {
+        let mut level = 0;
+        for &c in &chars {
+            if c == '#' { level += 1; } else { break; }
+        }
+        level
+    };
+    if heading_level > 0 && heading_level < len && chars[heading_level] == ' ' {
+        let mut ranges = vec![
+            (0, heading_level + 1, muted_style),            // "## " prefix
+            (heading_level + 1, len, accent_style),          // heading text
+        ];
+        // Remove zero-width range if heading fills the line
+        ranges.retain(|&(s, e, _)| s < e);
+        return ranges;
+    }
+
+    // Horizontal rule: trimmed line is 3+ chars all same (---, ***, ___)
+    {
+        let trimmed: Vec<char> = line.trim().chars().collect();
+        if trimmed.len() >= 3 {
+            let first = trimmed[0];
+            if (first == '-' || first == '*' || first == '_') && trimmed.iter().all(|&c| c == first) {
+                return vec![(0, len, muted_style)];
+            }
+        }
+    }
+
+    // Blockquote: starts with "> "
+    if chars.len() >= 2 && chars[0] == '>' && chars[1] == ' ' {
+        return vec![(0, 2, muted_style)];
+    }
+
+    // List marker: optional whitespace then "- ", "* ", or "+ " followed by text
+    {
+        let mut idx = 0;
+        while idx < chars.len() && chars[idx] == ' ' {
+            idx += 1;
+        }
+        if idx < chars.len()
+            && (chars[idx] == '-' || chars[idx] == '*' || chars[idx] == '+')
+            && idx + 1 < chars.len()
+            && chars[idx + 1] == ' '
+        {
+            // Style the marker (including leading spaces) as accent
+            let marker_end = idx + 2;
+            if marker_end < len {
+                return vec![(0, marker_end, accent_style)];
+            } else {
+                return vec![(0, len, accent_style)];
+            }
+        }
+    }
+
+    // Inline patterns scan (for non-heading, non-special lines)
+    let mut ranges: Vec<(usize, usize, Style)> = Vec::new();
+    let mut i = 0;
+    while i < len {
+        if chars[i] == '`' {
+            // Inline code: find matching backtick
+            let start = i;
+            i += 1;
+            let content_start = i;
+            while i < len && chars[i] != '`' {
+                i += 1;
+            }
+            if i < len {
+                // Found closing backtick
+                let content_end = i;
+                i += 1; // consume closing backtick
+                // Style opening backtick as muted
+                ranges.push((start, start + 1, muted_style));
+                // Style content as ok
+                if content_start < content_end {
+                    ranges.push((content_start, content_end, ok_style));
+                }
+                // Style closing backtick as muted
+                ranges.push((content_end, content_end + 1, muted_style));
+            }
+            // else: no closing backtick found, no special styling
+        } else if chars[i] == '*' {
+            // Check for bold (**...**)
+            if i + 1 < len && chars[i + 1] == '*' {
+                // Bold: find closing **
+                let start = i;
+                i += 2; // skip opening **
+                let content_start = i;
+                let mut found = false;
+                while i + 1 < len {
+                    if chars[i] == '*' && chars[i + 1] == '*' {
+                        found = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if found {
+                    let content_end = i;
+                    i += 2; // consume closing **
+                    ranges.push((start, start + 2, muted_style)); // opening **
+                    if content_start < content_end {
+                        ranges.push((content_start, content_end, Style::default().add_modifier(Modifier::BOLD)));
+                    }
+                    ranges.push((content_end, content_end + 2, muted_style)); // closing **
+                }
+                // else: no closing **, skip
+            } else {
+                // Italic: single * ... *
+                let start = i;
+                i += 1; // skip opening *
+                let content_start = i;
+                let mut found = false;
+                while i < len {
+                    if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
+                        found = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if found {
+                    let content_end = i;
+                    i += 1; // consume closing *
+                    ranges.push((start, start + 1, muted_style)); // opening *
+                    if content_start < content_end {
+                        ranges.push((content_start, content_end, Style::default().add_modifier(Modifier::ITALIC)));
+                    }
+                    ranges.push((content_end, content_end + 1, muted_style)); // closing *
+                }
+                // else: no closing *, skip
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    ranges
+}
+
 fn build_spans_for_row(
     visible_chars: &[char],
     col_offset: usize,
     lint_ranges: &[(usize, usize)],
     sel_ranges: &[(usize, usize)],
+    find_ranges: &[(usize, usize)],
+    find_active_ranges: &[(usize, usize)],
+    syn_ranges: &[(usize, usize, Style)],
     normal: Style,
     lint: Style,
     selected: Style,
+    find_match: Style,
+    find_active: Style,
 ) -> Vec<TSpan<'static>> {
     if visible_chars.is_empty() {
         return vec![];
     }
 
-    // Categories: 0 = normal, 1 = lint, 2 = selected (selection wins)
+    // Categories: 0 = syntax/normal, 1 = lint, 2 = find match, 3 = active find match, 4 = selection (wins all)
     let mut spans: Vec<TSpan<'static>> = Vec::new();
     let mut current_text = String::new();
     let mut current_cat: u8 = 0;
+    let mut current_syn_style: Style = normal;
 
     for (i, &c) in visible_chars.iter().enumerate() {
         let abs_col = col_offset + i;
-        let in_sel = sel_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
-        let in_lint = lint_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
-        let cat: u8 = if in_sel { 2 } else if in_lint { 1 } else { 0 };
+        let in_sel         = sel_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
+        let in_find_active = find_active_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
+        let in_find        = find_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
+        let in_lint        = lint_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
+        let cat: u8 = if in_sel { 4 } else if in_find_active { 3 } else if in_find { 2 } else if in_lint { 1 } else { 0 };
 
-        if cat != current_cat {
+        let syn_style = if cat == 0 {
+            syn_ranges
+                .iter()
+                .find(|&&(s, e, _)| abs_col >= s && abs_col < e)
+                .map(|&(_, _, st)| st)
+                .unwrap_or(normal)
+        } else {
+            normal
+        };
+
+        let flush = cat != current_cat || (cat == 0 && syn_style != current_syn_style);
+        if flush {
             if !current_text.is_empty() {
-                let style = match current_cat { 2 => selected, 1 => lint, _ => normal };
+                let style = match current_cat {
+                    4 => selected,
+                    3 => find_active,
+                    2 => find_match,
+                    1 => lint,
+                    _ => current_syn_style,
+                };
                 spans.push(TSpan::styled(current_text.clone(), style));
                 current_text.clear();
             }
             current_cat = cat;
+            current_syn_style = syn_style;
         }
         current_text.push(c);
     }
 
     if !current_text.is_empty() {
-        let style = match current_cat { 2 => selected, 1 => lint, _ => normal };
+        let style = match current_cat {
+            4 => selected,
+            3 => find_active,
+            2 => find_match,
+            1 => lint,
+            _ => current_syn_style,
+        };
         spans.push(TSpan::styled(current_text, style));
     }
 
     spans
+}
+
+fn render_markdown_preview(text: &str, palette: Palette, _width: usize) -> Text<'static> {
+    let opts = MdOptions::ENABLE_STRIKETHROUGH | MdOptions::ENABLE_TABLES;
+    let parser = MdParser::new_ext(text, opts);
+
+    let heading_style = Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let h1_style = Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let bold_style = Style::default().add_modifier(Modifier::BOLD);
+    let italic_style = Style::default().add_modifier(Modifier::ITALIC);
+    let code_style = Style::default().fg(palette.ok);
+    let rule_style = Style::default().fg(palette.muted);
+    let normal_style = Style::default().fg(palette.text);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<TSpan<'static>> = Vec::new();
+    let mut in_heading: Option<HeadingLevel> = None;
+    let mut in_bold = false;
+    let mut in_italic = false;
+    let in_code = false;
+    let mut in_code_block = false;
+    let mut list_depth: usize = 0;
+    let mut is_list_item = false;
+    let mut list_item_first = false;
+
+    let flush_line = |spans: &mut Vec<TSpan<'static>>, lines: &mut Vec<Line<'static>>| {
+        lines.push(Line::from(std::mem::take(spans)));
+    };
+
+    for event in parser {
+        match event {
+            MdEvent::Start(MdTag::Heading { level, .. }) => {
+                in_heading = Some(level);
+            }
+            MdEvent::End(MdTagEnd::Heading(_)) => {
+                flush_line(&mut current_spans, &mut lines);
+                in_heading = None;
+            }
+            MdEvent::Start(MdTag::Paragraph) => {}
+            MdEvent::End(MdTagEnd::Paragraph) => {
+                flush_line(&mut current_spans, &mut lines);
+                lines.push(Line::from(vec![])); // blank line after paragraph
+            }
+            MdEvent::Start(MdTag::Strong) => in_bold = true,
+            MdEvent::End(MdTagEnd::Strong) => in_bold = false,
+            MdEvent::Start(MdTag::Emphasis) => in_italic = true,
+            MdEvent::End(MdTagEnd::Emphasis) => in_italic = false,
+            MdEvent::Start(MdTag::CodeBlock(_)) => {
+                in_code_block = true;
+                lines.push(Line::from(vec![]));
+            }
+            MdEvent::End(MdTagEnd::CodeBlock) => {
+                in_code_block = false;
+                lines.push(Line::from(vec![]));
+            }
+            MdEvent::Code(s) => {
+                let style = code_style;
+                current_spans.push(TSpan::styled(format!("`{}`", s), style));
+            }
+            MdEvent::Start(MdTag::List(_)) => {
+                list_depth += 1;
+            }
+            MdEvent::End(MdTagEnd::List(_)) => {
+                list_depth = list_depth.saturating_sub(1);
+                if list_depth == 0 {
+                    lines.push(Line::from(vec![]));
+                }
+            }
+            MdEvent::Start(MdTag::Item) => {
+                is_list_item = true;
+                list_item_first = true;
+            }
+            MdEvent::End(MdTagEnd::Item) => {
+                flush_line(&mut current_spans, &mut lines);
+                is_list_item = false;
+            }
+            MdEvent::Rule => {
+                lines.push(Line::from(vec![TSpan::styled(
+                    "─".repeat(40),
+                    rule_style,
+                )]));
+            }
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                flush_line(&mut current_spans, &mut lines);
+            }
+            MdEvent::Text(s) => {
+                let style = if in_code_block {
+                    code_style
+                } else if let Some(level) = in_heading {
+                    match level {
+                        HeadingLevel::H1 => h1_style,
+                        _ => heading_style,
+                    }
+                } else if in_bold && in_italic {
+                    bold_style.add_modifier(Modifier::ITALIC)
+                } else if in_bold {
+                    bold_style
+                } else if in_italic {
+                    italic_style
+                } else if in_code {
+                    code_style
+                } else {
+                    normal_style
+                };
+
+                if in_code_block {
+                    // Emit each line of the code block separately
+                    let lines_vec: Vec<&str> = s.lines().collect();
+                    for (i, line) in lines_vec.iter().enumerate() {
+                        let indent = "  ".repeat(list_depth.max(1).saturating_sub(1) + 1);
+                        current_spans.push(TSpan::styled(
+                            format!("{}{}", indent, line),
+                            style,
+                        ));
+                        if i + 1 < lines_vec.len() {
+                            flush_line(&mut current_spans, &mut lines);
+                        }
+                    }
+                } else {
+                    let prefix = if is_list_item && list_item_first {
+                        list_item_first = false;
+                        let indent = "  ".repeat(list_depth.saturating_sub(1));
+                        format!("{indent}• ")
+                    } else {
+                        String::new()
+                    };
+                    let display = format!("{}{}", prefix, s);
+                    current_spans.push(TSpan::styled(display, style));
+                }
+            }
+            MdEvent::InlineHtml(_) | MdEvent::Html(_) => {}
+            MdEvent::Start(MdTag::BlockQuote(_)) | MdEvent::End(MdTagEnd::BlockQuote(_)) => {}
+            MdEvent::Start(MdTag::Link { dest_url, .. }) => {
+                current_spans.push(TSpan::styled("[", rule_style));
+                let _ = dest_url;
+            }
+            MdEvent::End(MdTagEnd::Link) => {
+                current_spans.push(TSpan::styled("]", rule_style));
+            }
+            MdEvent::Start(MdTag::Image { .. }) | MdEvent::End(MdTagEnd::Image) => {}
+            MdEvent::Start(MdTag::Table(_)) | MdEvent::End(MdTagEnd::Table) => {
+                flush_line(&mut current_spans, &mut lines);
+            }
+            MdEvent::Start(MdTag::TableHead)
+            | MdEvent::End(MdTagEnd::TableHead)
+            | MdEvent::Start(MdTag::TableRow)
+            | MdEvent::End(MdTagEnd::TableRow) => {
+                flush_line(&mut current_spans, &mut lines);
+            }
+            MdEvent::Start(MdTag::TableCell) => {
+                current_spans.push(TSpan::styled("│ ", rule_style));
+            }
+            MdEvent::End(MdTagEnd::TableCell) => {
+                current_spans.push(TSpan::styled(" ", normal_style));
+            }
+            _ => {}
+        }
+    }
+
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
+    }
+
+    // Remove trailing blank lines
+    while lines.last().map_or(false, |l: &Line<'_>| l.spans.is_empty()) {
+        lines.pop();
+    }
+
+    let _ = in_code;
+
+    Text::from(lines)
 }
 
 #[cfg(test)]
