@@ -31,6 +31,15 @@ pub struct Store {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub fn open_for_test() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("failed opening in-memory db")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let store = Self { conn };
+        store.init_schema()?;
+        Ok(store)
+    }
+
     pub fn open_default() -> Result<Self> {
         let data_dir = resolve_data_dir()?;
         std::fs::create_dir_all(&data_dir)
@@ -85,6 +94,7 @@ impl Store {
             "ALTER TABLE notes ADD COLUMN folder TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE notes ADD COLUMN tags   TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE notes ADD COLUMN note_order INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE notes ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0",
         ] {
             match self.conn.execute_batch(sql) {
                 Ok(_) => {}
@@ -115,137 +125,11 @@ impl Store {
     }
 
     pub fn list_notes(&self, query: &str) -> Result<Vec<NoteSummary>> {
-        let (tags, folder, show_archived, fts) = parse_query(query);
-
-        let mut notes = Vec::new();
-
-        let archive_clause = if show_archived {
-            "n.archived = 1".to_string()
-        } else {
-            "n.archived = 0".to_string()
-        };
-
-        if fts.is_empty() {
-            let mut where_clauses: Vec<String> = vec![archive_clause];
-            let mut bind_vals: Vec<String> = Vec::new();
-
-            for tag in &tags {
-                where_clauses
-                    .push("(' ' || n.tags || ' ') LIKE ?".to_string());
-                bind_vals.push(format!("% {} %", tag));
-            }
-            if let Some(ref f) = folder {
-                where_clauses.push("LOWER(n.folder) = ?".to_string());
-                bind_vals.push(f.clone());
-            }
-
-            let sql = format!(
-                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived, n.note_order \
-                 FROM notes n \
-                 WHERE {} \
-                 ORDER BY n.pinned DESC, n.updated_at DESC LIMIT 500",
-                where_clauses.join(" AND ")
-            );
-
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(bind_vals.iter()),
-                |row| {
-                    Ok(NoteSummary {
-                        id: row.get(0)?,
-                        title: row.get(1)?,
-                        updated_at: row.get(2)?,
-                        folder: row.get(3)?,
-                        tags: row.get(4)?,
-                        pinned: row.get::<_, i64>(5)? != 0,
-                        archived: row.get::<_, i64>(6)? != 0,
-                        note_order: row.get(7)?,
-                    })
-                },
-            )?;
-            for row in rows {
-                notes.push(row?);
-            }
-        } else {
-            let mut where_clauses: Vec<String> =
-                vec!["notes_fts MATCH ?".to_string(), archive_clause];
-            let mut bind_vals: Vec<String> = vec![fts.clone()];
-
-            for tag in &tags {
-                where_clauses
-                    .push("(' ' || n.tags || ' ') LIKE ?".to_string());
-                bind_vals.push(format!("% {} %", tag));
-            }
-            if let Some(ref f) = folder {
-                where_clauses.push("LOWER(n.folder) = ?".to_string());
-                bind_vals.push(f.clone());
-            }
-
-            let sql = format!(
-                "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived, n.note_order \
-                 FROM notes_fts f \
-                 JOIN notes n ON n.id = f.rowid \
-                 WHERE {} \
-                 ORDER BY n.pinned DESC, n.updated_at DESC LIMIT 200",
-                where_clauses.join(" AND ")
-            );
-
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(bind_vals.iter()),
-                |row| {
-                    Ok(NoteSummary {
-                        id: row.get(0)?,
-                        title: row.get(1)?,
-                        updated_at: row.get(2)?,
-                        folder: row.get(3)?,
-                        tags: row.get(4)?,
-                        pinned: row.get::<_, i64>(5)? != 0,
-                        archived: row.get::<_, i64>(6)? != 0,
-                        note_order: row.get(7)?,
-                    })
-                },
-            )?;
-            for row in rows {
-                notes.push(row?);
-            }
-        }
-
-        Ok(notes)
+        self.list_notes_internal(query, None)
     }
 
     pub fn list_notes_in_folder(&self, folder: &str, query: &str) -> Result<Vec<NoteSummary>> {
-        let (_tags, _folder_filter, show_archived, _fts) = parse_query(query);
-        let archive_clause = if show_archived { "n.archived = 1" } else { "n.archived = 0" };
-        let bind_folder = folder != "\x00ALL\x00";
-
-        let sql = format!(
-            "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived, n.note_order \
-             FROM notes n \
-             WHERE {} AND {} \
-             ORDER BY n.pinned DESC, n.note_order ASC, n.updated_at DESC LIMIT 500",
-            if bind_folder { "n.folder = ?" } else { "1=1" },
-            archive_clause
-        );
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut notes = Vec::new();
-        let map_row = |row: &rusqlite::Row<'_>| Ok(NoteSummary {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            updated_at: row.get(2)?,
-            folder: row.get(3)?,
-            tags: row.get(4)?,
-            pinned: row.get::<_, i64>(5)? != 0,
-            archived: row.get::<_, i64>(6)? != 0,
-            note_order: row.get(7)?,
-        });
-        if bind_folder {
-            for row in stmt.query_map(params![folder], map_row)? { notes.push(row?); }
-        } else {
-            for row in stmt.query_map([], map_row)? { notes.push(row?); }
-        }
-        Ok(notes)
+        self.list_notes_internal(query, Some(folder))
     }
 
     pub fn list_folders(&self) -> Result<Vec<FolderEntry>> {
@@ -319,31 +203,50 @@ impl Store {
     }
 
     pub fn create_note(&self, title: &str, body: &str) -> Result<i64> {
+        self.create_note_with_title_lock(title, body, false)
+    }
+
+    pub fn create_note_with_title_lock(
+        &self,
+        title: &str,
+        body: &str,
+        title_locked: bool,
+    ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
+        let note_title = if title_locked {
+            title.trim().to_string()
+        } else if body.trim().is_empty() {
+            title.trim().to_string()
+        } else {
+            derive_title(body)
+        };
+        let tags = extract_tags(body);
         self.conn.execute(
-            "INSERT INTO notes (title, body, created_at, updated_at) VALUES (?1, ?2, ?3, ?4)",
-            params![title, body, now, now],
+            "INSERT INTO notes (title, body, created_at, updated_at, tags, title_locked) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![note_title, body, now, now, tags, title_locked as i64],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
     pub fn capture(&self, title: Option<&str>, body: &str) -> Result<i64> {
-        let title = match title {
-            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-            _ => body
-                .lines()
-                .next()
-                .unwrap_or("Untitled")
-                .trim()
-                .chars()
-                .take(80)
-                .collect::<String>(),
-        };
-        self.create_note(&title, body)
+        match title {
+            Some(t) if !t.trim().is_empty() => self.create_note_with_title_lock(t.trim(), body, true),
+            _ => self.create_note("Untitled", body),
+        }
     }
 
     pub fn update_note(&self, id: i64, body: &str) -> Result<()> {
-        let title = derive_title(body);
+        let title_locked: bool = self.conn.query_row(
+            "SELECT title_locked FROM notes WHERE id = ?1",
+            params![id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )?;
+        let title = if title_locked {
+            self.conn
+                .query_row("SELECT title FROM notes WHERE id = ?1", params![id], |row| row.get(0))?
+        } else {
+            derive_title(body)
+        };
         let now = Utc::now().to_rfc3339();
         let tags = extract_tags(body);
         self.conn.execute(
@@ -351,6 +254,26 @@ impl Store {
             params![title, body, now, tags, id],
         )?;
         Ok(())
+    }
+
+    pub fn update_note_with_title(&self, id: i64, body: &str, title: &str, title_locked: bool) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let tags = extract_tags(body);
+        self.conn.execute(
+            "UPDATE notes SET title = ?1, body = ?2, updated_at = ?3, tags = ?4, title_locked = ?5 WHERE id = ?6",
+            params![title.trim(), body, now, tags, title_locked as i64, id],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_title_locked(&self, id: i64) -> Result<bool> {
+        self.conn.query_row(
+            "SELECT title_locked FROM notes WHERE id = ?1",
+            params![id],
+            |row| Ok(row.get::<_, i64>(0)? != 0),
+        )
+        .map_err(Into::into)
     }
 
     pub fn set_folder(&self, id: i64, folder: &str) -> Result<()> {
@@ -380,6 +303,91 @@ impl Store {
     pub fn delete_note(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
         Ok(())
+    }
+}
+
+impl Store {
+    fn list_notes_internal(&self, query: &str, folder_scope: Option<&str>) -> Result<Vec<NoteSummary>> {
+        let (tags, folder_filter, show_archived, fts) = parse_query(query);
+        if let Some(scope) = folder_scope {
+            if let Some(filter) = folder_filter.as_deref() {
+                if !scope.eq_ignore_ascii_case(filter) {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut bind_vals: Vec<String> = Vec::new();
+
+        let has_fts = !fts.is_empty();
+        if has_fts {
+            where_clauses.push("notes_fts MATCH ?".to_string());
+            bind_vals.push(fts);
+        }
+
+        where_clauses.push(if show_archived {
+            "n.archived = 1".to_string()
+        } else {
+            "n.archived = 0".to_string()
+        });
+
+        for tag in &tags {
+            where_clauses.push("(' ' || n.tags || ' ') LIKE ?".to_string());
+            bind_vals.push(format!("% {} %", tag));
+        }
+
+        match folder_scope {
+            Some(scope) => {
+                where_clauses.push("n.folder = ?".to_string());
+                bind_vals.push(scope.to_string());
+            }
+            None => {
+                if let Some(folder) = folder_filter {
+                    where_clauses.push("LOWER(n.folder) = ?".to_string());
+                    bind_vals.push(folder);
+                }
+            }
+        }
+
+        let order_by = if folder_scope.is_some() {
+            "n.pinned DESC, n.note_order ASC, n.updated_at DESC"
+        } else {
+            "n.pinned DESC, n.updated_at DESC"
+        };
+        let limit = if has_fts { 200 } else { 500 };
+        let from_clause = if has_fts {
+            "FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid"
+        } else {
+            "FROM notes n"
+        };
+        let sql = format!(
+            "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived, n.note_order \
+             {from_clause} \
+             WHERE {} \
+             ORDER BY {order_by} LIMIT {limit}",
+            where_clauses.join(" AND ")
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |row| {
+            Ok(NoteSummary {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                updated_at: row.get(2)?,
+                folder: row.get(3)?,
+                tags: row.get(4)?,
+                pinned: row.get::<_, i64>(5)? != 0,
+                archived: row.get::<_, i64>(6)? != 0,
+                note_order: row.get(7)?,
+            })
+        })?;
+
+        let mut notes = Vec::new();
+        for row in rows {
+            notes.push(row?);
+        }
+        Ok(notes)
     }
 }
 
@@ -469,4 +477,46 @@ fn parse_query(query: &str) -> (Vec<String>, Option<String>, bool, String) {
 
     let fts = fts_tokens.join(" ");
     (tags, folder, show_archived, fts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Store;
+
+    #[test]
+    fn create_note_extracts_tags_immediately() {
+        let store = Store::open_for_test().unwrap();
+        let id = store.create_note("Untitled", "Ship #Rust #fts today").unwrap();
+
+        let notes = store.list_notes("#rust").unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, id);
+        assert_eq!(notes[0].tags, "rust fts");
+    }
+
+    #[test]
+    fn locked_titles_survive_body_updates() {
+        let store = Store::open_for_test().unwrap();
+        let id = store
+            .create_note_with_title_lock("Imported Name", "first line\nbody", true)
+            .unwrap();
+
+        store.update_note(id, "changed first line\nbody").unwrap();
+        let note = store.list_notes("").unwrap().into_iter().find(|note| note.id == id).unwrap();
+        assert_eq!(note.title, "Imported Name");
+        assert!(store.is_title_locked(id).unwrap());
+    }
+
+    #[test]
+    fn folder_queries_honor_fts_and_tags() {
+        let store = Store::open_for_test().unwrap();
+        let alpha = store.create_note("Untitled", "alpha rust #work").unwrap();
+        let beta = store.create_note("Untitled", "beta rust #personal").unwrap();
+        store.set_folder(alpha, "projects").unwrap();
+        store.set_folder(beta, "projects").unwrap();
+
+        let notes = store.list_notes_in_folder("projects", "rust #work").unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, alpha);
+    }
 }

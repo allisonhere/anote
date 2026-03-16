@@ -862,6 +862,43 @@ impl App {
         self.tree.get(self.tree_cursor).and_then(|item| item.note())
     }
 
+    fn normalize_note_orders_in_group(&mut self, folder: &str) -> Result<()> {
+        let ids: Vec<i64> = self.tree.iter()
+            .filter_map(|item| item.note())
+            .filter(|n| n.folder == folder)
+            .map(|n| n.id)
+            .collect();
+        let base: i64 = if folder.is_empty() {
+            self.store.list_folders()?
+                .iter().map(|f| f.sort_order).max().unwrap_or(0)
+        } else {
+            0
+        };
+        for (i, &id) in ids.iter().enumerate() {
+            self.store.set_note_order(id, base + (i as i64 + 1) * 10)?;
+        }
+        Ok(())
+    }
+
+    fn toggle_folder(&mut self, name: &str, expanded: bool) -> Result<()> {
+        if expanded {
+            self.tree_expanded.remove(name);
+            self.status = format!("Collapsed folder '{}'", name);
+        } else {
+            self.tree_expanded.insert(name.to_string());
+            self.status = format!("Expanded folder '{}'", name);
+        }
+        self.rebuild_tree()?;
+        if let Some(pos) = self
+            .tree
+            .iter()
+            .position(|item| item.folder_name() == Some(name))
+        {
+            self.tree_cursor = pos;
+        }
+        Ok(())
+    }
+
     fn normal_is_down(&self, key: &KeyEvent) -> bool {
         match self.keymap {
             KeymapPreset::Default | KeymapPreset::Vim => {
@@ -946,6 +983,47 @@ impl App {
             }
         }
 
+        // Left/Right: expand/collapse folders
+        match key.code {
+            KeyCode::Right => {
+                match self.tree.get(self.tree_cursor).cloned() {
+                    Some(TreeItem::Folder { name, expanded, .. }) => {
+                        if !expanded {
+                            // Expand the folder
+                            self.toggle_folder(&name, false)?;
+                        } else {
+                            // Already expanded: move into first child note
+                            let next = self.tree_cursor + 1;
+                            if next < self.tree.len() {
+                                if let Some(TreeItem::Note(_)) = self.tree.get(next) {
+                                    self.tree_cursor = next;
+                                    self.sync_active_note_from_cursor()?;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            KeyCode::Left => {
+                match self.tree.get(self.tree_cursor).cloned() {
+                    Some(TreeItem::Folder { name, expanded, .. }) => {
+                        if expanded {
+                            self.toggle_folder(&name, true)?;
+                        }
+                    }
+                    Some(TreeItem::Note(note)) if !note.folder.is_empty() => {
+                        // Collapse parent folder and land on it
+                        self.toggle_folder(&note.folder, true)?;
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+
         if self.normal_is_down(&key) {
             if self.tree_cursor + 1 < self.tree.len() {
                 self.tree_cursor += 1;
@@ -965,12 +1043,7 @@ impl App {
         match key.code {
             KeyCode::Char(' ') => {
                 if let Some(TreeItem::Folder { name, expanded, .. }) = self.tree.get(self.tree_cursor).cloned() {
-                    if expanded {
-                        self.tree_expanded.remove(&name);
-                    } else {
-                        self.tree_expanded.insert(name);
-                    }
-                    self.rebuild_tree()?;
+                    self.toggle_folder(&name, expanded)?;
                 }
             }
             KeyCode::Char(':') => {
@@ -979,7 +1052,18 @@ impl App {
                 self.status = "Command mode".to_string();
             }
             KeyCode::Char('n') => {
+                let target_folder = match self.tree.get(self.tree_cursor) {
+                    Some(TreeItem::Folder { name, .. }) => {
+                        self.tree_expanded.insert(name.clone());
+                        name.clone()
+                    }
+                    Some(TreeItem::Note(n)) => n.folder.clone(),
+                    None => String::new(),
+                };
                 let id = self.store.create_note("Untitled", "")?;
+                if !target_folder.is_empty() {
+                    self.store.set_folder(id, &target_folder)?;
+                }
                 self.refresh_notes()?;
                 self.select_by_id(id);
                 self.sync_active_note_from_cursor()?;
@@ -989,12 +1073,7 @@ impl App {
             KeyCode::Char('e') | KeyCode::Enter => {
                 match self.tree.get(self.tree_cursor).cloned() {
                     Some(TreeItem::Folder { name, expanded, .. }) => {
-                        if expanded {
-                            self.tree_expanded.remove(&name);
-                        } else {
-                            self.tree_expanded.insert(name);
-                        }
-                        self.rebuild_tree()?;
+                        self.toggle_folder(&name, expanded)?;
                     }
                     Some(TreeItem::Note(_)) => {
                         if self.active_note_id.is_some() {
@@ -1051,6 +1130,7 @@ impl App {
                         self.tree_expanded.remove(&name);
                         if self.tree_cursor > 0 { self.tree_cursor -= 1; }
                         self.rebuild_tree()?;
+                        self.sync_active_note_from_cursor()?;
                         self.status = format!("Deleted folder '{}'", name);
                     }
                     Some(TreeItem::Note(n)) => {
@@ -1061,6 +1141,7 @@ impl App {
                         }
                         if self.tree_cursor > 0 { self.tree_cursor -= 1; }
                         self.rebuild_tree()?;
+                        self.sync_active_note_from_cursor()?;
                         self.status = "Deleted".to_string();
                     }
                     None => {}
@@ -1700,6 +1781,7 @@ impl App {
                     // Ensure folder entry exists in folders table
                     if !name.trim().is_empty() {
                         let _ = self.store.create_folder(name.trim());
+                        self.tree_expanded.insert(name.trim().to_string());
                     }
                     self.refresh_notes()?;
                     self.select_by_id(id);
@@ -1793,27 +1875,49 @@ impl App {
         self.tree.clear();
         let folders = self.store.list_folders()?;
         let query = self.query.clone();
+        let root_notes = self.store.list_notes_in_folder("", &query)?;
+        let max_folder_order = folders.iter().map(|folder| folder.sort_order).max().unwrap_or(0);
 
-        for folder in &folders {
-            let expanded = self.tree_expanded.contains(&folder.name);
-            let notes_in_folder = self.store.list_notes_in_folder(&folder.name, &query)?;
-            let note_count = notes_in_folder.len();
-            self.tree.push(TreeItem::Folder {
-                name: folder.name.clone(),
-                expanded,
-                note_count,
-            });
-            if expanded {
-                for note in notes_in_folder {
-                    self.tree.push(TreeItem::Note(note));
-                }
-            }
+        #[derive(Clone)]
+        enum TopLevelItem {
+            Folder(crate::storage::FolderEntry),
+            RootNote(NoteSummary),
         }
 
-        // Root notes (no folder)
-        let root_notes = self.store.list_notes_in_folder("", &query)?;
+        let mut top_level: Vec<(i64, i64, TopLevelItem)> = Vec::new();
+        for folder in folders {
+            top_level.push((folder.sort_order, 0, TopLevelItem::Folder(folder)));
+        }
         for note in root_notes {
-            self.tree.push(TreeItem::Note(note));
+            let effective_order = if note.note_order == 0 {
+                max_folder_order + 1
+            } else {
+                note.note_order
+            };
+            let pin_rank = if note.pinned { 0 } else { 1 };
+            top_level.push((effective_order, pin_rank, TopLevelItem::RootNote(note)));
+        }
+        top_level.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        for (_, _, item) in top_level {
+            match item {
+                TopLevelItem::Folder(folder) => {
+                    let expanded = self.tree_expanded.contains(&folder.name);
+                    let notes_in_folder = self.store.list_notes_in_folder(&folder.name, &query)?;
+                    let note_count = notes_in_folder.len();
+                    self.tree.push(TreeItem::Folder {
+                        name: folder.name,
+                        expanded,
+                        note_count,
+                    });
+                    if expanded {
+                        for note in notes_in_folder {
+                            self.tree.push(TreeItem::Note(note));
+                        }
+                    }
+                }
+                TopLevelItem::RootNote(note) => self.tree.push(TreeItem::Note(note)),
+            }
         }
 
         // Clamp cursor
@@ -1906,7 +2010,7 @@ impl App {
                         lines[0] = input.clone();
                         lines.join("\n")
                     };
-                    self.store.update_note(id, &new_body)?;
+                    self.store.update_note_with_title(id, &new_body, &input, true)?;
                 }
                 self.status = format!("Renamed to: {}", input);
             }
@@ -1955,48 +2059,63 @@ impl App {
 
                 match self.tree.get(target_idx).cloned() {
                     Some(TreeItem::Note(other_note)) if other_note.folder == note_folder => {
+                        if note.note_order == other_note.note_order {
+                            self.normalize_note_orders_in_group(&note_folder)?;
+                        }
                         self.store.swap_note_order(note_id, other_note.id)?;
                         self.rebuild_tree()?;
                         self.tree_cursor = target_idx;
                     }
                     Some(TreeItem::Note(other_note)) => {
-                        self.store.set_folder(note_id, &other_note.folder)?;
+                        let dest_folder = other_note.folder.clone();
+                        if note.note_order == other_note.note_order {
+                            self.normalize_note_orders_in_group(&dest_folder)?;
+                        }
+                        self.store.set_folder(note_id, &dest_folder)?;
                         self.store.swap_note_order(note_id, other_note.id)?;
                         self.rebuild_tree()?;
                         self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
                     }
-                    Some(TreeItem::Folder { name: ref folder_name, expanded, .. }) => {
+                    Some(TreeItem::Folder { name: ref folder_name, .. }) => {
                         let folder_name = folder_name.clone();
+                        let folder_sort_order = self
+                            .store
+                            .list_folders()?
+                            .into_iter()
+                            .find(|folder| folder.name == folder_name)
+                            .map(|folder| folder.sort_order)
+                            .unwrap_or(0);
                         if direction < 0 {
+                            // Moving up past a folder: move note to root, before the folder
                             if target_idx == 0 {
                                 self.store.set_folder(note_id, "")?;
+                                self.store.set_note_order(note_id, folder_sort_order - 1)?;
                                 self.rebuild_tree()?;
                                 self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
                             } else {
                                 match self.tree.get(target_idx - 1).cloned() {
                                     Some(TreeItem::Note(prev_note)) => {
-                                        self.store.set_folder(note_id, &prev_note.folder)?;
+                                        let prev_folder = prev_note.folder.clone();
+                                        if note.note_order == prev_note.note_order {
+                                            self.normalize_note_orders_in_group(&prev_folder)?;
+                                        }
+                                        self.store.set_folder(note_id, &prev_folder)?;
                                         self.store.swap_note_order(note_id, prev_note.id)?;
                                         self.rebuild_tree()?;
                                         self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
                                     }
                                     _ => {
                                         self.store.set_folder(note_id, "")?;
+                                        self.store.set_note_order(note_id, folder_sort_order - 1)?;
                                         self.rebuild_tree()?;
                                         self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
                                     }
                                 }
                             }
-                        } else if expanded {
-                            self.store.set_folder(note_id, &folder_name)?;
-                            let folder_notes = self.store.list_notes_in_folder(&folder_name, "")?;
-                            if let Some(first) = folder_notes.first() {
-                                self.store.set_note_order(note_id, first.note_order.saturating_sub(1))?;
-                            }
-                            self.rebuild_tree()?;
-                            self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
                         } else {
-                            self.store.set_folder(note_id, "")?;
+                            // Moving down past a folder: move note into that folder
+                            self.tree_expanded.insert(folder_name.clone());
+                            self.store.set_folder(note_id, &folder_name)?;
                             self.rebuild_tree()?;
                             self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
                         }
@@ -2754,13 +2873,16 @@ impl App {
                         } else {
                             let icon = if *expanded { "\u{f0176} " } else { "\u{f0153} " };
                             let count_text = format!("  ({})", note_count);
-                            let mut spans = vec![
+                            let count_style = if is_selected {
+                                Style::default().fg(palette.bg)
+                            } else {
+                                Style::default().fg(palette.muted)
+                            };
+                            let spans = vec![
                                 TSpan::styled(icon.to_string(), if is_selected { base_style } else { Style::default().fg(palette.accent) }),
                                 TSpan::styled(name.clone(), base_style),
+                                TSpan::styled(count_text, count_style),
                             ];
-                            if !is_selected {
-                                spans.push(TSpan::styled(count_text, Style::default().fg(palette.muted)));
-                            }
                             ListItem::new(Line::from(spans))
                         }
                     }
@@ -2780,40 +2902,26 @@ impl App {
                             "  "
                         };
                         let note_icon = if note.pinned { "\u{f0403} " } else { "\u{f0219} " };
-                        let ts = short_timestamp(&note.updated_at);
 
                         // If renaming this note, show inline input
                         if matches!(&self.tree_inline_mode, TreeInlineMode::RenameNote(id) if *id == note.id) {
                             let input_line = format!("{}{} {}█", tree_prefix, note_icon, self.tree_inline_input);
                             ListItem::new(TSpan::styled(input_line, Style::default().fg(palette.accent)))
                         } else {
-                            let spans = vec![
+                            let pill_colors = self.theme.tag_pill_colors();
+                            let mut spans = vec![
                                 TSpan::styled(tree_prefix.to_string(), Style::default().fg(palette.muted)),
                                 TSpan::styled(note_icon.to_string(), if is_selected { base_style } else { Style::default().fg(palette.muted) }),
                                 TSpan::styled(note.title.clone(), base_style),
-                                TSpan::styled(format!("  {}", ts), if is_selected { base_style } else { Style::default().fg(palette.muted) }),
                             ];
-
-                            let mut lines = vec![Line::from(spans)];
-                            if !note.tags.is_empty() {
-                                let tag_indent = if in_folder { "\u{2502}  " } else { "   " };
-                                let pill_colors = self.theme.tag_pill_colors();
-                                let mut tag_spans: Vec<TSpan<'static>> = vec![TSpan::styled(tag_indent.to_string(), Style::default().fg(palette.muted))];
-                                for tag in note.tags.split_whitespace() {
-                                    tag_spans.push(TSpan::styled(
-                                        format!(" #{} ", tag),
-                                        pill_style_for_tag(tag, pill_colors),
-                                    ));
-                                    tag_spans.push(TSpan::raw(" "));
-                                }
-                                lines.push(Line::from(tag_spans));
+                            for tag in note.tags.split_whitespace() {
+                                spans.push(TSpan::raw(" "));
+                                spans.push(TSpan::styled(
+                                    "●",
+                                    tag_dot_style(tag, pill_colors),
+                                ));
                             }
-
-                            if lines.len() == 1 {
-                                ListItem::new(lines.remove(0))
-                            } else {
-                                ListItem::new(Text::from(lines))
-                            }
+                            ListItem::new(Line::from(spans))
                         }
                     }
                 };
@@ -2846,6 +2954,7 @@ impl App {
             .title(" Notes ")
             .style(Style::default().bg(palette.panel).fg(palette.text))
             .border_style(Style::default().fg(list_border_color));
+        frame.render_widget(Clear, notes_area);
         if self.mode != Mode::Edit {
             let mut list_state = ratatui::widgets::ListState::default();
             list_state.select(Some(self.tree_cursor));
@@ -2856,25 +2965,46 @@ impl App {
             );
         }
 
-        let meta_base = Style::default()
+        let meta_base = Style::default().bg(palette.panel).fg(palette.muted);
+        let title_style = Style::default()
             .bg(palette.panel)
-            .fg(palette.muted)
-            .add_modifier(Modifier::ITALIC);
-        let active_meta_line: Line<'static> = if let Some(summary) = self.active_summary() {
-            let mut spans: Vec<TSpan<'static>> = Vec::new();
-            spans.push(TSpan::styled(
-                format!("id:{}  updated:{}", summary.id, summary.updated_at),
-                meta_base,
-            ));
+            .fg(palette.text)
+            .add_modifier(Modifier::BOLD);
+        let header_lines: Vec<Line<'static>> = if let Some(summary) = self.active_summary() {
+            let pill_colors = self.theme.tag_pill_colors();
+            let mut lines = vec![Line::from(vec![TSpan::styled(summary.title.clone(), title_style)])];
+
+            let mut meta_spans: Vec<TSpan<'static>> = vec![
+                TSpan::styled(format!("updated {}", short_timestamp(&summary.updated_at)), meta_base),
+                TSpan::styled(format!("  id:{}", summary.id), meta_base),
+            ];
             if !summary.folder.is_empty() {
-                spans.push(TSpan::styled(
+                meta_spans.push(TSpan::styled(
                     format!("  folder:{}", summary.folder),
                     meta_base,
                 ));
             }
-            Line::from(spans)
+            lines.push(Line::from(meta_spans));
+
+            if !summary.tags.is_empty() {
+                let mut tag_spans: Vec<TSpan<'static>> = Vec::new();
+                for (idx, tag) in summary.tags.split_whitespace().enumerate() {
+                    if idx > 0 {
+                        tag_spans.push(TSpan::raw(" "));
+                    }
+                    tag_spans.push(TSpan::styled("●", tag_dot_style(tag, pill_colors)));
+                    tag_spans.push(TSpan::raw(" "));
+                    tag_spans.push(TSpan::styled(
+                        format!("#{} ", tag),
+                        pill_style_for_tag(tag, pill_colors),
+                    ));
+                }
+                lines.push(Line::from(tag_spans));
+            }
+
+            lines
         } else {
-            Line::styled("no note selected", meta_base)
+            vec![Line::styled("no note selected", meta_base)]
         };
 
         let editor_title = match self.mode {
@@ -2911,13 +3041,13 @@ impl App {
 
         let editor_layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .constraints([Constraint::Length(header_lines.len() as u16), Constraint::Min(1)])
             .split(editor_inner);
 
         self.editor_col_width = editor_layout[1].width as usize;
         self.editor_row_height = editor_layout[1].height as usize;
 
-        let meta = Paragraph::new(active_meta_line);
+        let meta = Paragraph::new(Text::from(header_lines));
         frame.render_widget(meta, editor_layout[0]);
 
         let mut cursor_x = editor_layout[1].x;
@@ -3187,6 +3317,15 @@ fn pill_style_for_tag(tag: &str, colors: &[(Color, Color)]) -> Style {
         % colors.len();
     let (bg, fg) = colors[idx];
     Style::default().bg(bg).fg(fg)
+}
+
+fn tag_dot_style(tag: &str, colors: &[(Color, Color)]) -> Style {
+    let idx = tag
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize))
+        % colors.len();
+    let (bg, _) = colors[idx];
+    Style::default().fg(bg)
 }
 
 fn short_timestamp(ts: &str) -> String {
@@ -3733,5 +3872,36 @@ mod tests {
     fn normalize_paste_keeps_tab_stops_consistent() {
         assert_eq!(normalize_pasted_text("\tX", 0, 4), "    X");
         assert_eq!(normalize_pasted_text("\tX", 3, 4), " X");
+    }
+
+    #[test]
+    fn folder_expand_collapse_roundtrip() {
+        use crate::storage::Store;
+        use super::{App, TreeItem};
+        let store = Store::open_for_test().unwrap();
+        store.create_folder("Work").unwrap();
+        let id = store.create_note("Note A", "").unwrap();
+        store.set_folder(id, "Work").unwrap();
+        let id2 = store.create_note("Note B", "").unwrap();
+        store.set_folder(id2, "Work").unwrap();
+
+        let mut app = App::new(store).unwrap();
+        // Starts collapsed: only the folder row, no notes
+        assert_eq!(app.tree.len(), 1, "collapsed: only folder header");
+        assert!(matches!(app.tree[0], TreeItem::Folder { expanded: false, .. }));
+
+        // Expand
+        app.tree_expanded.insert("Work".to_string());
+        app.rebuild_tree().unwrap();
+        assert_eq!(app.tree.len(), 3, "expanded: folder + 2 notes");
+        assert!(matches!(app.tree[0], TreeItem::Folder { expanded: true, .. }));
+        assert!(matches!(app.tree[1], TreeItem::Note(_)));
+        assert!(matches!(app.tree[2], TreeItem::Note(_)));
+
+        // Collapse
+        app.tree_expanded.remove("Work");
+        app.rebuild_tree().unwrap();
+        assert_eq!(app.tree.len(), 1, "collapsed again: only folder header");
+        assert!(matches!(app.tree[0], TreeItem::Folder { expanded: false, .. }));
     }
 }
