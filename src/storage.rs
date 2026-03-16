@@ -428,8 +428,9 @@ fn is_tag_char(c: char) -> bool {
 }
 
 fn extract_tags(body: &str) -> String {
+    let first_line = body.lines().next().unwrap_or("");
     let mut tags: Vec<String> = Vec::new();
-    let chars: Vec<char> = body.chars().collect();
+    let chars: Vec<char> = first_line.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '#' {

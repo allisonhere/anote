@@ -1114,10 +1114,10 @@ impl App {
                     self.delete_pending = true;
                     let what = match self.tree.get(self.tree_cursor) {
                         Some(TreeItem::Folder { name, note_count, .. }) =>
-                            format!("Delete folder '{}' ({} notes lose folder)? Press d to confirm", name, note_count),
+                            format!("Delete folder '{}' ({} notes lose folder)? d=confirm  any other key=cancel", name, note_count),
                         Some(TreeItem::Note(n)) =>
-                            format!("Delete '{}'? Press d to confirm", n.title),
-                        _ => "Delete? Press d to confirm".to_string(),
+                            format!("Delete '{}'? d=confirm  any other key=cancel", n.title),
+                        _ => "Delete? d=confirm  any other key=cancel".to_string(),
                     };
                     self.status = what;
                 }
@@ -1205,8 +1205,10 @@ impl App {
             return Ok(false);
         }
 
-        // Lint jumps (default keymap only; vim uses ] and [ for other things)
-        if self.keymap == KeymapPreset::Default {
+        // Lint jumps: default keymap always; vim keymap only in Normal mode (] and [ are motion keys in Insert)
+        let vim_normal = self.keymap == KeymapPreset::Vim
+            && self.editor_state.mode == EditorMode::Normal;
+        if self.keymap == KeymapPreset::Default || vim_normal {
             if key.code == KeyCode::Char(']') && self.lints_active {
                 self.selection_anchor = None;
                 if let Some(off) = self.next_lint_offset() {
@@ -1621,16 +1623,17 @@ impl App {
             self.status = format!("Find: {}  [no matches]", self.find_query);
         } else if self.find_committed {
             self.status = format!(
-                "Find: {}  [{}/{}]  n/↓ next  N/↑ prev  Enter edit here  Esc close",
-                self.find_query,
+                "NAVIGATE  {}/{}  n/↓ next  N/↑ prev  Enter=edit  Bksp=edit query  type=new search  Esc=close  [{}]",
                 self.find_cursor + 1,
                 self.find_matches.len(),
+                self.find_query,
             );
         } else {
             self.status = format!(
-                "Find: {}  [{} matches]  Enter confirm  Esc cancel",
+                "FIND  {}  [{} match{}]  Enter/Tab=navigate  Esc=cancel",
                 self.find_query,
                 self.find_matches.len(),
+                if self.find_matches.len() == 1 { "" } else { "es" },
             );
         }
     }
@@ -1639,7 +1642,7 @@ impl App {
         self.find_matches.clear();
         self.find_cursor = 0;
         if self.find_query.is_empty() {
-            self.status = "Find: ".to_string();
+            self.status = "FIND  type to search  Esc=cancel".to_string();
             return;
         }
         let flat = self.editor_buffer.to_text();
@@ -1856,6 +1859,71 @@ impl App {
                     self.dirty = true;
                     self.save_active_note()?;
                     self.status = format!("Renamed to: {}", new_title);
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
+            "tag" => {
+                let tag = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+                if tag.is_empty() {
+                    self.status = "Usage: :tag <name>".to_string();
+                } else if let Some(id) = self.active_note_id {
+                    if let Some(note) = self.store.get_note(id)? {
+                        if body_has_tag(&note.body, &tag) {
+                            self.status = format!("Already tagged: #{}", tag);
+                        } else {
+                            let new_body = append_tag_to_body(&note.body, &tag);
+                            self.store.update_note(id, &new_body)?;
+                            self.load_note_into_editor(&new_body);
+                            self.refresh_notes()?;
+                            self.select_by_id(id);
+                            self.status = format!("Tagged: #{}", tag);
+                        }
+                    }
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
+            "untag" => {
+                let tag = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+                if tag.is_empty() {
+                    self.status = "Usage: :untag <name>".to_string();
+                } else if let Some(id) = self.active_note_id {
+                    if let Some(note) = self.store.get_note(id)? {
+                        let new_body = remove_tag_from_body(&note.body, &tag);
+                        if new_body == note.body {
+                            self.status = format!("Tag #{} not found", tag);
+                        } else {
+                            self.store.update_note(id, &new_body)?;
+                            self.load_note_into_editor(&new_body);
+                            self.refresh_notes()?;
+                            self.select_by_id(id);
+                            self.status = format!("Removed tag: #{}", tag);
+                        }
+                    }
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
+            "discard" => {
+                if let Some(id) = self.active_note_id {
+                    if let Some(note) = self.store.get_note(id)? {
+                        self.load_note_into_editor(&note.body);
+                        self.dirty = false;
+                        self.lints.clear();
+                        self.lints_active = false;
+                        self.status = "Changes discarded".to_string();
+                    }
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
+            "unfolder" => {
+                if let Some(id) = self.active_note_id {
+                    self.store.set_folder(id, "")?;
+                    self.refresh_notes()?;
+                    self.select_by_id(id);
+                    self.status = "Moved to root (no folder)".to_string();
                 } else {
                     self.status = "No active note".to_string();
                 }
@@ -3229,18 +3297,18 @@ impl App {
             pad(),
             heading("  NORMAL MODE"),
             row("j/k  ↑↓",        "navigate tree"),
-            row("Space/Enter",     "expand/collapse folder"),
+            row("→ / Space/Enter", "expand folder or enter"),
+            row("←",              "collapse folder (or go to parent)"),
             row("Enter / e",       "open note for edit"),
-            row("n",               "new note"),
+            row("n",               "new note in current folder"),
             row("f",               "new folder"),
             row("r",               "rename note or folder"),
-            row("d d",             "delete note or folder"),
+            row("d d",             "delete  (any other key cancels)"),
             row("Shift+↑↓",        "move note/folder"),
             row("/",               "search notes"),
             row(":",               "command palette"),
             row("\\",              "toggle notes pane"),
             row("q",               "quit"),
-            row("#tag in body",    "add tag to note"),
             pad(),
             heading("  COLLAPSED PANE"),
             row("j/k  ↑↓",        "scroll preview"),
@@ -3253,7 +3321,7 @@ impl App {
             row("Ctrl+C / X",      "copy / cut"),
             row("Ctrl+V",          "paste"),
             row("Ctrl+L",          "spell/grammar lint"),
-            row("Tab",             "apply lint fix"),
+            row("Tab",             "apply lint fix (when lint active)"),
             row("] / [",           "next / prev lint"),
             pad(),
             Line::from(vec![bold("  DEFAULT "), dim("(default keymap)")]),
@@ -3267,25 +3335,30 @@ impl App {
             row("y / d",           "yank / delete"),
             row("p / P",           "paste (clipboard)"),
             row("u / Ctrl+R",      "undo / redo"),
+            row("] / [",           "next/prev lint (Normal mode only)"),
             pad(),
             heading("  SEARCH  (/)"),
-            row("#tag",            "filter by tag"),
-            row("#tag in body",    "adds searchable tag"),
+            row("#tag",            "filter by tag (first line of note)"),
             row("/folder",         "filter by folder"),
             row(":archived",       "show archived"),
             pad(),
             heading("  COMMANDS  (:)"),
             row(":new",            "create note"),
-            row(":folder <name>",  "move to folder"),
+            row(":edit",           "enter edit mode"),
+            row(":rename <title>", "rename note"),
+            row(":folder <name>",  "move to folder (empty = root)"),
+            row(":unfolder",       "remove from folder (move to root)"),
+            row(":tag / :untag",   "add/remove #tag on first line"),
             row(":pin / :unpin",   "pin to top"),
             row(":archive",        "hide from list"),
             row(":unarchive",      "restore archived"),
+            row(":discard",        "discard unsaved changes"),
             row(":search <q>",     "search"),
+            row(":reload",         "refresh list from disk"),
             row(":theme <name>",   "neo-noir|paper|matrix"),
             row(":keymap <name>",  "default|vim"),
-            row(":reload",         "refresh list"),
             pad(),
-            Line::from(vec![dim("  F6 theme  F7 keymap  "), key("?/Esc"), dim(" close")]),
+            Line::from(vec![dim("  F6 theme  F7 keymap  F8 density  "), key("?/Esc"), dim(" close")]),
             pad(),
         ];
 
@@ -3331,6 +3404,92 @@ fn tag_dot_style(tag: &str, colors: &[(Color, Color)]) -> Style {
 fn short_timestamp(ts: &str) -> String {
     ts.get(0..16).unwrap_or(ts).to_string()
 }
+
+fn is_tag_boundary(c: char) -> bool {
+    !c.is_ascii_alphanumeric() && c != '_' && c != '-'
+}
+
+/// Returns true if the first line of `body` contains `#tag` as a whole tag token.
+fn body_has_tag(body: &str, tag: &str) -> bool {
+    let first_line = body.lines().next().unwrap_or("").to_ascii_lowercase();
+    let needle = format!("#{}", tag);
+    let mut pos = 0;
+    while pos < first_line.len() {
+        if let Some(found) = first_line[pos..].find(&needle) {
+            let abs = pos + found;
+            let after = abs + needle.len();
+            let next_is_continuation = first_line[after..].chars().next()
+                .map(|c| !is_tag_boundary(c))
+                .unwrap_or(false);
+            if !next_is_continuation {
+                return true;
+            }
+            pos = abs + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Appends ` #tag` to the end of the first line of `body`.
+fn append_tag_to_body(body: &str, tag: &str) -> String {
+    let token = format!(" #{}", tag);
+    match body.find('\n') {
+        Some(nl) => format!("{}{}{}", &body[..nl], token, &body[nl..]),
+        None => format!("{}{}", body, token),
+    }
+}
+
+/// Removes all whole-token occurrences of `#tag` from the first line of `body`.
+fn remove_tag_from_body(body: &str, tag: &str) -> String {
+    let nl = body.find('\n');
+    let first_line = match nl {
+        Some(pos) => &body[..pos],
+        None => body,
+    };
+    let rest = match nl {
+        Some(pos) => &body[pos..],
+        None => "",
+    };
+
+    let needle = format!("#{}", tag);
+    let mut line = first_line.to_string();
+    let mut search_from = 0;
+    loop {
+        let lower = line[search_from..].to_ascii_lowercase();
+        if let Some(found) = lower.find(&needle) {
+            let abs = search_from + found;
+            let after = abs + needle.len();
+            let next_is_continuation = line[after..].chars().next()
+                .map(|c| !is_tag_boundary(c))
+                .unwrap_or(false);
+            if next_is_continuation {
+                search_from = abs + 1;
+                continue;
+            }
+            // Eat a leading space before the token to avoid leaving double spaces
+            let remove_start = if abs > 0 && line.as_bytes()[abs - 1] == b' ' {
+                abs - 1
+            } else {
+                abs
+            };
+            // Or eat a trailing space after the token
+            let remove_end = if line[after..].starts_with(' ') && remove_start == abs {
+                after + 1
+            } else {
+                after
+            };
+            line = format!("{}{}", &line[..remove_start], &line[remove_end..]);
+            search_from = remove_start;
+        } else {
+            break;
+        }
+    }
+
+    format!("{}{}", line, rest)
+}
+
 
 fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     if ranges.is_empty() {
@@ -3866,6 +4025,38 @@ mod tests {
         let mut buf = EditorBuffer::new();
         buf.insert_pasted_str("one\r\ntwo\tthree\r\n\tfour");
         assert_eq!(buf.to_text(), "one\ntwo three\n    four");
+    }
+
+    #[test]
+    fn tag_helpers_add_and_remove() {
+        use super::{body_has_tag, append_tag_to_body, remove_tag_from_body};
+
+        assert!(!body_has_tag("hello world", "rust"));
+        assert!(body_has_tag("hello #rust world", "rust"));
+        assert!(!body_has_tag("hello #rustacean world", "rust")); // prefix, not whole tag
+        assert!(body_has_tag("hello #Rust world", "rust")); // case-insensitive
+
+        // append_tag_to_body appends to the first line
+        let body = append_tag_to_body("hello", "rust");
+        assert_eq!(body, "hello #rust");
+        assert!(body_has_tag(&body, "rust"));
+
+        // body on multiple lines: tag goes on first line only
+        let body_ml = append_tag_to_body("hello\nbody text", "rust");
+        assert_eq!(body_ml, "hello #rust\nbody text");
+        assert!(body_has_tag(&body_ml, "rust"));
+        assert!(!body_has_tag("first line\nbody text #rust", "rust")); // only first line counts
+
+        // remove from first line
+        let removed = remove_tag_from_body("hello #rust\nbody", "rust");
+        assert_eq!(removed, "hello\nbody");
+        assert!(!body_has_tag(&removed, "rust"));
+
+        // Should not touch a tag with same prefix
+        let body2 = "notes #rustacean #rust end";
+        let removed2 = remove_tag_from_body(body2, "rust");
+        assert!(removed2.contains("#rustacean"));
+        assert!(!body_has_tag(&removed2, "rust"));
     }
 
     #[test]
