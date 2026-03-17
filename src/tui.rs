@@ -846,8 +846,6 @@ impl App {
             .min(self.editor_buffer.lines.len().saturating_sub(1));
         self.editor_buffer.cursor_row = target_row;
         self.editor_buffer.cursor_col = 0;
-        self.editor_state.cursor.row = target_row;
-        self.editor_state.cursor.col = 0;
         self.editor_scroll = 0;
         self.editor_state.mode = match self.keymap {
             KeymapPreset::Default => EditorMode::Insert,
@@ -858,7 +856,11 @@ impl App {
         } else {
             "Edit mode".to_string()
         };
-        self.sync_editor_buffer_from_state();
+        // Vim: push editor_buffer → edtui state so edtui has current content.
+        // Default: editor_buffer is the source of truth; no sync needed.
+        if self.keymap == KeymapPreset::Vim {
+            self.sync_state_from_editor_buffer();
+        }
     }
 
     fn active_summary(&self) -> Option<&NoteSummary> {
