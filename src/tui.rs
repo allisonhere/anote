@@ -548,6 +548,7 @@ pub struct App {
     notes_pane_collapsed: bool,
     preview_scroll: u16,
     help_scroll: u16,
+    editor_scroll: usize,
 }
 
 impl App {
@@ -601,6 +602,7 @@ impl App {
             notes_pane_collapsed: false,
             preview_scroll: 0,
             help_scroll: 0,
+            editor_scroll: 0,
         };
         app.apply_editor_keymap();
         app.refresh_notes()?;
@@ -846,6 +848,7 @@ impl App {
         self.editor_buffer.cursor_col = 0;
         self.editor_state.cursor.row = target_row;
         self.editor_state.cursor.col = 0;
+        self.editor_scroll = 0;
         self.editor_state.mode = match self.keymap {
             KeymapPreset::Default => EditorMode::Insert,
             KeymapPreset::Vim => EditorMode::Normal,
@@ -958,6 +961,14 @@ impl App {
         }
 
         if self.notes_pane_collapsed {
+            if self.normal_is_down(&key) {
+                self.preview_scroll = self.preview_scroll.saturating_add(1);
+                return Ok(false);
+            }
+            if self.normal_is_up(&key) {
+                self.preview_scroll = self.preview_scroll.saturating_sub(1);
+                return Ok(false);
+            }
             if key.code == KeyCode::PageDown {
                 self.preview_scroll = self.preview_scroll.saturating_add(20);
                 return Ok(false);
@@ -2027,6 +2038,7 @@ impl App {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.preview_scroll = 0;
+        self.editor_scroll = 0;
     }
 
     fn save_active_note(&mut self) -> Result<()> {
@@ -2567,7 +2579,7 @@ impl App {
         result
     }
 
-    fn editor_view(&self, area: Rect, palette: Palette) -> (Text<'static>, u16, u16, u16) {
+    fn editor_view(&mut self, area: Rect, palette: Palette) -> (Text<'static>, u16, u16, u16) {
         if area.width == 0 || area.height == 0 {
             return (Text::default(), area.x, area.y, 0);
         }
@@ -2750,8 +2762,18 @@ impl App {
             }
         }
 
-        // Scroll so cursor stays within the viewport
-        let visual_row_offset = cursor_visual_row.saturating_sub(height.saturating_sub(1));
+        // Sticky scroll: only move the viewport when the cursor leaves it.
+        let visual_row_offset = if cursor_visual_row < self.editor_scroll {
+            // Cursor moved above the top of the viewport — scroll up to cursor.
+            cursor_visual_row
+        } else if height > 0 && cursor_visual_row >= self.editor_scroll + height {
+            // Cursor moved below the bottom of the viewport — scroll down minimally.
+            cursor_visual_row.saturating_sub(height.saturating_sub(1))
+        } else {
+            // Cursor is still within the viewport — don't scroll.
+            self.editor_scroll
+        };
+        self.editor_scroll = visual_row_offset;
 
         let cursor_x = area.x + cursor_visual_col as u16;
         let cursor_y = area.y + (cursor_visual_row - visual_row_offset) as u16;
@@ -2843,11 +2865,7 @@ impl App {
             frame.area(),
         );
 
-        let status_height = if self.density == Density::Compact {
-            1
-        } else {
-            2
-        };
+        let status_height = 1u16;
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2867,7 +2885,7 @@ impl App {
             let color = if count > 0 { palette.danger } else { palette.ok };
             (format!("  lints:{}", count), color)
         } else {
-            ("  lints:-".to_string(), palette.muted)
+            (String::new(), palette.muted)
         };
 
         let note_count = self.tree.iter().filter(|i| i.is_note()).count();
@@ -3060,12 +3078,9 @@ impl App {
                     if idx > 0 {
                         tag_spans.push(TSpan::raw(" "));
                     }
-                    tag_spans.push(TSpan::styled("●", tag_dot_style(tag, pill_colors)));
-                    tag_spans.push(TSpan::raw(" "));
-                    tag_spans.push(TSpan::styled(
-                        format!("#{} ", tag),
-                        pill_style_for_tag(tag, pill_colors),
-                    ));
+                    for span in tag_pill_spans(tag, pill_colors, palette.panel) {
+                        tag_spans.push(span);
+                    }
                 }
                 lines.push(Line::from(tag_spans));
             }
@@ -3241,20 +3256,24 @@ impl App {
             }
         };
 
-        let status = Paragraph::new(status_line).style(
+        let status_style = if self.delete_pending {
+            Style::default()
+                .bg(palette.danger)
+                .fg(palette.bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
             Style::default()
                 .bg(palette.panel)
                 .fg(if self.mode == Mode::Command {
                     palette.accent
-                } else if self.delete_pending {
-                    palette.danger
                 } else if self.dirty {
                     palette.danger
                 } else {
                     palette.ok
                 })
-                .add_modifier(Modifier::BOLD),
-        );
+                .add_modifier(Modifier::BOLD)
+        };
+        let status = Paragraph::new(status_line).style(status_style);
         frame.render_widget(status, layout[2]);
 
         if self.mode == Mode::Help {
@@ -3265,7 +3284,7 @@ impl App {
 
     fn render_help_overlay(&mut self, frame: &mut Frame, palette: Palette) {
         let area = frame.area();
-        let w = area.width.min(52);
+        let w = area.width.min(70);
         let h = area.height.min(50);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = area.y + (area.height.saturating_sub(h)) / 2;
@@ -3383,22 +3402,33 @@ impl App {
     }
 }
 
-fn pill_style_for_tag(tag: &str, colors: &[(Color, Color)]) -> Style {
-    let idx = tag
-        .bytes()
+fn tag_color_idx(tag: &str, len: usize) -> usize {
+    tag.bytes()
         .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize))
-        % colors.len();
-    let (bg, fg) = colors[idx];
+        % len
+}
+
+fn pill_style_for_tag(tag: &str, colors: &[(Color, Color)]) -> Style {
+    let (bg, fg) = colors[tag_color_idx(tag, colors.len())];
     Style::default().bg(bg).fg(fg)
 }
 
 fn tag_dot_style(tag: &str, colors: &[(Color, Color)]) -> Style {
-    let idx = tag
-        .bytes()
-        .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize))
-        % colors.len();
-    let (bg, _) = colors[idx];
+    let (bg, _) = colors[tag_color_idx(tag, colors.len())];
     Style::default().fg(bg)
+}
+
+///// Returns spans for a rounded pill using Nerd Font powerline glyphs (requires Nerd Font).
+/// `row_bg` should be the background color of the containing row so the caps blend in.
+fn tag_pill_spans(tag: &str, colors: &[(Color, Color)], row_bg: Color) -> Vec<TSpan<'static>> {
+    let (bg, fg) = colors[tag_color_idx(tag, colors.len())];
+    let cap = Style::default().fg(bg).bg(row_bg);
+    let body = Style::default().bg(bg).fg(fg);
+    vec![
+        TSpan::styled("\u{E0B6}", cap),
+        TSpan::styled(format!("#{} ", tag), body),
+        TSpan::styled("\u{E0B4}", cap),
+    ]
 }
 
 fn short_timestamp(ts: &str) -> String {
