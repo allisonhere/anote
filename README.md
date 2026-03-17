@@ -77,6 +77,16 @@ Override:
 ANOTE_CONFIG_PATH=/path/to/config.toml cargo run
 ```
 
+### Options
+
+```toml
+theme   = "neo-noir"   # neo-noir | paper | matrix
+keymap  = "default"    # default | vim
+density = "cozy"       # cozy | compact
+```
+
+All fields are optional — missing fields fall back to the defaults above. Changes to `theme` and `keymap` can also be made at runtime via `:theme <name>` and `:keymap <name>` in the command palette (they are written back to the config file automatically).
+
 ## TUI keybindings
 
 ### Normal mode
@@ -179,3 +189,5 @@ Navigation phase (after Enter):
 ## Tags
 
 Write `#tagname` anywhere in a note body — tags are extracted automatically and searchable with `#tag` in the search bar.
+
+Tags are displayed as colored pills in the note header. The pill caps use Nerd Font powerline glyphs (`\uE0B6`/`\uE0B4`) — install a [Nerd Font](https://www.nerdfonts.com/) and set it as your terminal font for the best appearance.
