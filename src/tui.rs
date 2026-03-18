@@ -543,6 +543,7 @@ pub struct App {
     find_cursor: usize,
     find_committed: bool,
     pre_search_query: String,
+    pre_search_cursor: usize,
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     notes_pane_collapsed: bool,
@@ -597,6 +598,7 @@ impl App {
             find_cursor: 0,
             find_committed: false,
             pre_search_query: String::new(),
+            pre_search_cursor: 0,
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             notes_pane_collapsed: false,
@@ -841,10 +843,8 @@ impl App {
 
     fn enter_edit_mode(&mut self) {
         self.mode = Mode::Edit;
-        // Position cursor at preview scroll row (clamped to valid range)
-        let target_row = (self.preview_scroll as usize)
-            .min(self.editor_buffer.lines.len().saturating_sub(1));
-        self.editor_buffer.cursor_row = target_row;
+        let target_row = self.preview_scroll_target_row();
+        self.editor_buffer.cursor_row = target_row.min(self.editor_buffer.lines.len().saturating_sub(1));
         self.editor_buffer.cursor_col = 0;
         self.editor_scroll = 0;
         self.editor_state.mode = match self.keymap {
@@ -918,6 +918,54 @@ impl App {
                 matches!(key.code, KeyCode::Char('k') | KeyCode::Up)
             }
         }
+    }
+
+    fn preview_scroll_target_row(&self) -> usize {
+        let width = self.editor_col_width.max(1);
+        let mut visual_rows = 0usize;
+
+        for (idx, line) in self.editor_buffer.lines.iter().enumerate() {
+            let line_len = line.chars().count();
+            let wraps = line_len.max(1).div_ceil(width);
+            let next = visual_rows + wraps;
+            if (self.preview_scroll as usize) < next {
+                return idx;
+            }
+            visual_rows = next;
+        }
+
+        self.editor_buffer.lines.len().saturating_sub(1)
+    }
+
+    fn restore_search_cursor(&mut self, cursor: usize) -> Result<()> {
+        if self.tree.is_empty() {
+            self.tree_cursor = 0;
+            self.sync_active_note_from_cursor()?;
+            return Ok(());
+        }
+
+        self.tree_cursor = cursor.min(self.tree.len().saturating_sub(1));
+        self.sync_active_note_from_cursor()?;
+        Ok(())
+    }
+
+    fn refresh_search_results_preserving_selection(&mut self) -> Result<()> {
+        let active_id = self.active_note_id;
+        self.refresh_notes()?;
+
+        if let Some(id) = active_id {
+            if let Some(pos) = self
+                .tree
+                .iter()
+                .position(|item| item.note().map(|n| n.id == id).unwrap_or(false))
+            {
+                self.tree_cursor = pos;
+                self.sync_active_note_from_cursor()?;
+                return Ok(());
+            }
+        }
+
+        self.restore_search_cursor(0)
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -1099,6 +1147,7 @@ impl App {
             KeyCode::Char('/') => {
                 self.mode = Mode::Search;
                 self.pre_search_query = self.query.clone();
+                self.pre_search_cursor = self.tree_cursor;
                 self.search_input = self.query.clone();
                 self.status = "Search mode".to_string();
             }
@@ -1248,9 +1297,14 @@ impl App {
 
     fn handle_edit_key_default(&mut self, key: KeyEvent) -> Result<bool> {
         if key.code == KeyCode::Esc {
+            if self.dirty {
+                self.save_active_note()?;
+                self.status = "Saved and returned to preview".to_string();
+            } else {
+                self.status = "Normal mode".to_string();
+            }
             self.mode = Mode::Normal;
             self.selection_anchor = None;
-            self.status = "Normal mode".to_string();
             return Ok(false);
         }
         if is_ctrl_char(&key, 'z') {
@@ -1312,9 +1366,14 @@ impl App {
 
     fn handle_edit_key_vim_edtui(&mut self, key: KeyEvent) -> Result<bool> {
         if self.editor_state.mode == EditorMode::Normal && key.code == KeyCode::Esc {
+            if self.dirty {
+                self.save_active_note()?;
+                self.status = "Saved and returned to preview".to_string();
+            } else {
+                self.status = "Normal mode".to_string();
+            }
             self.mode = Mode::Normal;
             self.selection_anchor = None;
-            self.status = "Normal mode".to_string();
             return Ok(false);
         }
 
@@ -1494,8 +1553,7 @@ impl App {
             KeyCode::Esc => {
                 self.query = self.pre_search_query.clone();
                 self.refresh_notes()?;
-                self.tree_cursor = 0;
-                self.sync_active_note_from_cursor()?;
+                self.restore_search_cursor(self.pre_search_cursor)?;
                 self.mode = Mode::Normal;
                 self.status = "Search canceled".to_string();
             }
@@ -1512,17 +1570,13 @@ impl App {
                 self.search_input.pop();
                 let q = self.search_input.trim().to_string();
                 self.query = q;
-                self.refresh_notes()?;
-                self.tree_cursor = 0;
-                self.sync_active_note_from_cursor()?;
+                self.refresh_search_results_preserving_selection()?;
             }
             KeyCode::Char(c) => {
                 self.search_input.push(c);
                 let q = self.search_input.trim().to_string();
                 self.query = q;
-                self.refresh_notes()?;
-                self.tree_cursor = 0;
-                self.sync_active_note_from_cursor()?;
+                self.refresh_search_results_preserving_selection()?;
             }
             _ => {}
         }
@@ -3210,16 +3264,6 @@ impl App {
         };
         let dirty_text = if self.dirty { "*" } else { "" };
 
-        let lint_hint = if self.mode == Mode::Edit {
-            if self.lints_active {
-                "  Ctrl+L re-lint  Tab fix  ]/[ jump"
-            } else {
-                "  Ctrl+L lint"
-            }
-        } else {
-            ""
-        };
-
         let inline_hint = if self.tree_inline_mode != TreeInlineMode::None {
             match &self.tree_inline_mode {
                 TreeInlineMode::CreateFolder => format!("  New folder: {}█  Enter confirm  Esc cancel", self.tree_inline_input),
@@ -3231,29 +3275,39 @@ impl App {
             String::new()
         };
 
+        let footer_width = layout[2].width as usize;
         let status_line = match self.mode {
-            Mode::Search => format!("/{search}", search = self.search_input),
-            Mode::Command => format!(":{}", self.command_input),
+            Mode::Search => fit_footer_left(&format!("/{}", self.search_input), footer_width),
+            Mode::Command => fit_footer_left(&format!(":{}", self.command_input), footer_width),
+            Mode::Help => fit_footer_segments(
+                &format!("[{}] {}", mode_text, self.status),
+                &["j/k scroll", "PgUp/PgDn", "Esc close"],
+                footer_width,
+            ),
             Mode::Edit | Mode::Find => {
-                format!(
-                    "[{mode}] {status} {dirty} | Esc exit | Ctrl+S save | F6 theme | F7 keymap{lint_hint}",
-                    mode = mode_text,
-                    status = self.status,
-                    dirty = dirty_text,
-                    lint_hint = lint_hint,
-                )
+                let left = format!("[{}] {} {}", mode_text, self.status, dirty_text);
+                let hints: Vec<&str> = if self.mode == Mode::Find {
+                    vec!["Esc close", "Enter edit", "Bksp query"]
+                } else if self.lints_active {
+                    vec!["Esc preview", "Ctrl+S save", "Ctrl+L lint", "Tab fix", "]/[ jump"]
+                } else {
+                    vec!["Esc preview", "Ctrl+S save", "Ctrl+F find", "Ctrl+L lint"]
+                };
+                fit_footer_segments(&left, &hints, footer_width)
             }
-            Mode::Help => "  j/k scroll  Esc/? close".to_string(),
             _ => {
                 if !inline_hint.is_empty() {
-                    inline_hint.clone()
+                    fit_footer_left(&inline_hint, footer_width)
                 } else {
-                    format!(
-                        "[{mode}] {status} {dirty} | : command  n new  f folder  r rename  d delete  \\ pane | F6 theme | F7 keymap | ? help | q quit",
-                        mode = mode_text,
-                        status = self.status,
-                        dirty = dirty_text,
-                    )
+                    let left = format!("[{}] {} {}", mode_text, self.status, dirty_text);
+                    let hints: Vec<&str> = if self.delete_pending {
+                        vec!["d confirm", "any key cancel"]
+                    } else if self.notes_pane_collapsed {
+                        vec!["j/k scroll", "PgUp/PgDn", "\\ notes", "? help", "q quit"]
+                    } else {
+                        vec![": command", "n new", "f folder", "/ search", "? help", "q quit"]
+                    };
+                    fit_footer_segments(&left, &hints, footer_width)
                 }
             }
         };
@@ -3402,6 +3456,53 @@ impl App {
             .scroll((self.help_scroll, 0));
         frame.render_widget(para, inner);
     }
+}
+
+fn fit_footer_left(text: &str, width: usize) -> String {
+    truncate_with_ellipsis(text, width)
+}
+
+fn fit_footer_segments(left: &str, hints: &[&str], width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let left = truncate_with_ellipsis(left.trim(), width);
+    let left_len = left.chars().count();
+    if left_len >= width || hints.is_empty() {
+        return left;
+    }
+
+    let mut line = left;
+    for hint in hints {
+        let segment = format!(" | {}", hint);
+        let seg_len = segment.chars().count();
+        if line.chars().count() + seg_len > width {
+            break;
+        }
+        line.push_str(&segment);
+    }
+    line
+}
+
+fn truncate_with_ellipsis(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let trimmed = text.trim();
+    let len = trimmed.chars().count();
+    if len <= width {
+        return trimmed.to_string();
+    }
+
+    if width == 1 {
+        return "…".to_string();
+    }
+
+    let mut out: String = trimmed.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
 
 fn tag_color_idx(tag: &str, len: usize) -> usize {

@@ -188,6 +188,6 @@ Navigation phase (after Enter):
 
 ## Tags
 
-Write `#tagname` anywhere in a note body — tags are extracted automatically and searchable with `#tag` in the search bar.
+Write `#tagname` on the first line of a note — tags are extracted automatically and searchable with `#tag` in the search bar.
 
 Tags are displayed as colored pills in the note header. The pill caps use Nerd Font powerline glyphs (`\uE0B6`/`\uE0B4`) — install a [Nerd Font](https://www.nerdfonts.com/) and set it as your terminal font for the best appearance.
