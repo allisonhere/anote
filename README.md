@@ -110,8 +110,8 @@ All fields are optional — missing fields fall back to the defaults above. The 
 | `x` | toggle note selection |
 | `*` | select all visible notes |
 | `u` | clear selection |
-| `p` | pin / unpin note |
-| `a` | archive / unarchive note |
+| `p` | pin selected notes or toggle current note |
+| `a` | archive selected/current note |
 | `A` | open archive browser |
 | `T` | open trash browser |
 | `D` | move selected note(s) to trash |
@@ -178,6 +178,7 @@ Navigation phase (after Enter):
 
 | Key | Action |
 |-----|--------|
+| `j` / `k` or `↑` / `↓` | move through tags |
 | `Enter` | filter notes by selected tag |
 | `n` | create a new tag |
 | `c` / `e` | choose a color for selected tag |
@@ -188,21 +189,24 @@ Navigation phase (after Enter):
 
 | Key / Command | Action |
 |---------------|--------|
-| `a` | archive, confirm archive, or unarchive the current note |
+| `a` | archive the selected or current note |
 | `A` | open archive browser |
 | `T` | open trash browser |
 | `D` | move selected note(s) to trash |
+| `j` / `k` or `↑` / `↓` | move in archive or trash browser |
 | `U` | unarchive in archive browser |
 | `D` | move archived note to trash in archive browser |
 | `R` | restore in trash browser |
 | `P` | purge in trash browser |
+| `x` / `*` / `u` | mark / all / clear inside archive or trash browser |
+| typing / `Backspace` | live-filter archive or trash browser results |
 | `:archive` | arm archive confirmation for the current note |
 | `:archive!` | confirm and archive immediately |
-| `:unarchive` | restore an archived note |
+| `:unarchive` | unarchive the current note |
 | `:archived` | open archive browser |
 | `:trash` | open trash browser |
-| `:restore` | restore the selected trash note |
-| `:purge` | permanently delete the selected trash note |
+| `:restore` | restore the current trashed note |
+| `:purge` | permanently delete the current trashed note |
 | `:empty-trash` | permanently delete all trashed notes |
 
 ### Vim keymap extras

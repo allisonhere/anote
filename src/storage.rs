@@ -19,7 +19,6 @@ pub struct NoteSummary {
 
 #[derive(Debug, Clone)]
 pub struct FolderEntry {
-    pub id: i64,
     pub name: String,
     pub sort_order: i64,
 }
@@ -164,16 +163,6 @@ impl Store {
         self.list_notes_internal(query, folder_scope, show_archived, show_trash)
     }
 
-    pub fn list_notes_in_folder_scoped(
-        &self,
-        folder: &str,
-        query: &str,
-        show_archived: bool,
-        show_trash: bool,
-    ) -> Result<Vec<NoteSummary>> {
-        self.list_notes_internal(query, Some(folder), show_archived, show_trash)
-    }
-
     pub fn list_tags(&self) -> Result<Vec<TagEntry>> {
         let mut stmt = self.conn.prepare(
             "WITH tag_counts AS (
@@ -225,10 +214,10 @@ impl Store {
 
     pub fn list_folders(&self) -> Result<Vec<FolderEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, sort_order FROM folders ORDER BY sort_order, name"
+            "SELECT name, sort_order FROM folders ORDER BY sort_order, name"
         )?;
         let folders = stmt.query_map([], |row| {
-            Ok(FolderEntry { id: row.get(0)?, name: row.get(1)?, sort_order: row.get(2)? })
+            Ok(FolderEntry { name: row.get(0)?, sort_order: row.get(1)? })
         })?.collect::<Result<Vec<_>, _>>()?;
         Ok(folders)
     }
