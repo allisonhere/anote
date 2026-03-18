@@ -51,6 +51,7 @@ enum Mode {
     Search,
     Command,
     Find,
+    Switcher,
     Help,
 }
 
@@ -553,6 +554,9 @@ pub struct App {
     query: String,
     search_input: String,
     command_input: String,
+    switcher_input: String,
+    switcher_cursor: usize,
+    switcher_results: Vec<NoteSummary>,
     mode: Mode,
     status: String,
     dirty: bool,
@@ -606,6 +610,9 @@ impl App {
             query: String::new(),
             search_input: String::new(),
             command_input: String::new(),
+            switcher_input: String::new(),
+            switcher_cursor: 0,
+            switcher_results: Vec::new(),
             mode: Mode::Normal,
             status: "Ready".to_string(),
             dirty: false,
@@ -791,6 +798,7 @@ impl App {
             Mode::Search => self.handle_search_key(key),
             Mode::Command => self.handle_command_key(key),
             Mode::Find => self.handle_find_key(key),
+            Mode::Switcher => self.handle_switcher_key(key),
             Mode::Help => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -1044,6 +1052,52 @@ impl App {
         self.restore_search_cursor(0)
     }
 
+    fn open_switcher(&mut self) -> Result<()> {
+        self.switcher_input.clear();
+        self.switcher_cursor = 0;
+        self.refresh_switcher_results()?;
+        self.mode = Mode::Switcher;
+        self.status = "Switcher: type to jump to a note".to_string();
+        Ok(())
+    }
+
+    fn refresh_switcher_results(&mut self) -> Result<()> {
+        let query = if self.switcher_input.trim().is_empty() {
+            String::new()
+        } else {
+            self.switcher_input.trim().to_string()
+        };
+        self.switcher_results = self.store.list_notes_for_switcher(&query)?;
+        if self.switcher_cursor >= self.switcher_results.len() {
+            self.switcher_cursor = self.switcher_results.len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    fn accept_switcher_selection(&mut self) -> Result<()> {
+        let Some(selected) = self.switcher_results.get(self.switcher_cursor).cloned() else {
+            self.status = "No matching note".to_string();
+            self.mode = Mode::Normal;
+            return Ok(());
+        };
+
+        if self.dirty {
+            self.save_active_note()?;
+        }
+        if selected.archived && !self.query.contains(":archived") {
+            self.query = ":archived".to_string();
+            self.refresh_notes()?;
+        } else if self.query.contains(":trash") {
+            self.query.clear();
+            self.refresh_notes()?;
+        }
+        self.select_by_id(selected.id);
+        self.sync_active_note_from_cursor()?;
+        self.mode = Mode::Normal;
+        self.status = format!("Jumped to {}", selected.title);
+        Ok(())
+    }
+
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
         // Handle inline tree input (folder create/rename/note rename)
         if self.tree_inline_mode != TreeInlineMode::None {
@@ -1066,6 +1120,12 @@ impl App {
 
         if key.code == KeyCode::Char('?') {
             self.mode = Mode::Help;
+            return Ok(false);
+        }
+
+        if is_ctrl_char(&key, 'p') {
+            self.quit_pending = false;
+            self.open_switcher()?;
             return Ok(false);
         }
 
@@ -1212,6 +1272,58 @@ impl App {
                 self.enter_edit_mode();
                 self.status = "Created note".to_string();
             }
+            KeyCode::Char('p') => {
+                if let Some(id) = self.active_note_id {
+                    let pinned = self.active_summary().map(|note| note.pinned).unwrap_or(false);
+                    self.store.set_pinned(id, !pinned)?;
+                    self.refresh_notes()?;
+                    self.select_by_id(id);
+                    self.sync_active_note_from_cursor()?;
+                    self.status = if pinned { "Note unpinned".to_string() } else { "Note pinned".to_string() };
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(id) = self.active_note_id {
+                    let archived = self.active_summary().map(|note| note.archived).unwrap_or(false);
+                    self.store.set_archived(id, !archived)?;
+                    self.refresh_notes()?;
+                    if archived {
+                        self.select_by_id(id);
+                        self.status = "Note unarchived".to_string();
+                    } else {
+                        self.status = "Note archived".to_string();
+                    }
+                    self.sync_active_note_from_cursor()?;
+                }
+            }
+            KeyCode::Char('A') => {
+                if self.query.contains(":archived") {
+                    self.query = self.query.replace(":archived", "").trim().to_string();
+                    self.status = "Archived filter off".to_string();
+                } else if self.query.is_empty() {
+                    self.query = ":archived".to_string();
+                    self.status = "Showing archived notes".to_string();
+                } else {
+                    self.query = format!("{} :archived", self.query.trim());
+                    self.status = "Showing archived notes".to_string();
+                }
+                self.refresh_notes()?;
+                self.restore_search_cursor(0)?;
+            }
+            KeyCode::Char('T') => {
+                if self.query.contains(":trash") {
+                    self.query = self.query.replace(":trash", "").trim().to_string();
+                    self.status = "Trash filter off".to_string();
+                } else if self.query.is_empty() {
+                    self.query = ":trash".to_string();
+                    self.status = "Showing trash".to_string();
+                } else {
+                    self.query = format!("{} :trash", self.query.trim());
+                    self.status = "Showing trash".to_string();
+                }
+                self.refresh_notes()?;
+                self.restore_search_cursor(0)?;
+            }
             KeyCode::Char('e') | KeyCode::Enter => {
                 match self.tree.get(self.tree_cursor).cloned() {
                     Some(TreeItem::Folder { name, expanded, .. }) => {
@@ -1277,7 +1389,11 @@ impl App {
                         self.status = format!("Deleted folder '{}'", name);
                     }
                     Some(TreeItem::Note(n)) => {
-                        self.store.delete_note(n.id)?;
+                        if self.query.contains(":trash") {
+                            self.store.purge_note(n.id)?;
+                        } else {
+                            self.store.delete_note(n.id)?;
+                        }
                         if self.active_note_id == Some(n.id) {
                             self.active_note_id = None;
                             self.load_note_into_editor("");
@@ -1285,7 +1401,11 @@ impl App {
                         if self.tree_cursor > 0 { self.tree_cursor -= 1; }
                         self.rebuild_tree()?;
                         self.sync_active_note_from_cursor()?;
-                        self.status = "Deleted".to_string();
+                        self.status = if self.query.contains(":trash") {
+                            "Note permanently deleted".to_string()
+                        } else {
+                            "Moved to trash".to_string()
+                        };
                     }
                     None => {}
                 }
@@ -1299,6 +1419,11 @@ impl App {
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if is_ctrl_char(&key, 'p') {
+            self.open_switcher()?;
+            return Ok(false);
+        }
+
         // Ctrl+S: save and stay in edit mode
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             self.save_active_note()?;
@@ -1642,10 +1767,11 @@ impl App {
             KeyCode::Enter => {
                 self.query = self.search_input.trim().to_string();
                 self.mode = Mode::Normal;
+                let result_count = self.tree.iter().filter(|item| item.is_note()).count();
                 self.status = if self.query.is_empty() {
                     "Search cleared  (#tag /folder text)".to_string()
                 } else {
-                    format!("Search: {}  (#tag /folder text)", self.query)
+                    format!("Search: {}  [{} result{}]", self.query, result_count, if result_count == 1 { "" } else { "s" })
                 };
             }
             KeyCode::Backspace => {
@@ -1659,6 +1785,39 @@ impl App {
                 let q = self.search_input.trim().to_string();
                 self.query = q;
                 self.refresh_search_results_preserving_selection()?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_switcher_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = "Switcher canceled".to_string();
+            }
+            KeyCode::Enter => {
+                self.accept_switcher_selection()?;
+            }
+            KeyCode::Up => {
+                self.switcher_cursor = self.switcher_cursor.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if self.switcher_cursor + 1 < self.switcher_results.len() {
+                    self.switcher_cursor += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                self.switcher_input.pop();
+                self.refresh_switcher_results()?;
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.switcher_input.push(c);
+                self.refresh_switcher_results()?;
             }
             _ => {}
         }
@@ -1930,6 +2089,34 @@ impl App {
                     self.set_sort_mode(sort_mode)?;
                 } else {
                     self.status = "Usage: :sort manual|updated|title".to_string();
+                }
+            }
+            "trash" => {
+                self.query = ":trash".to_string();
+                self.refresh_notes()?;
+                self.restore_search_cursor(0)?;
+                self.status = "Showing trash".to_string();
+            }
+            "restore" => {
+                if let Some(id) = self.active_note_id {
+                    self.store.restore_note(id)?;
+                    self.query = self.query.replace(":trash", "").trim().to_string();
+                    self.refresh_notes()?;
+                    self.select_by_id(id);
+                    self.sync_active_note_from_cursor()?;
+                    self.status = "Note restored".to_string();
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
+            "purge" => {
+                if let Some(id) = self.active_note_id {
+                    self.store.purge_note(id)?;
+                    self.refresh_notes()?;
+                    self.sync_active_note_from_cursor()?;
+                    self.status = "Note permanently deleted".to_string();
+                } else {
+                    self.status = "No active note".to_string();
                 }
             }
             "folder" => {
@@ -3108,6 +3295,8 @@ impl App {
             if tree_len == 0 && self.tree_inline_mode != TreeInlineMode::CreateFolder {
                 let empty_message = if self.query.is_empty() {
                     "No notes yet. Press 'n' to create or 'f' for a folder.".to_string()
+                } else if self.query.contains(":trash") {
+                    format!("Trash is empty for '{}'. Press 'T' to leave trash.", self.query)
                 } else if self.query.contains(":archived") {
                     format!("No archived notes match '{}'. Press '/' to refine.", self.query)
                 } else {
@@ -3283,6 +3472,7 @@ impl App {
             Mode::Search => " Preview ",
             Mode::Command => " Preview ",
             Mode::Find => " Edit (find) ",
+            Mode::Switcher => " Preview ",
             Mode::Help => " Preview ",
         };
 
@@ -3382,6 +3572,7 @@ impl App {
             Mode::Search => "SEARCH",
             Mode::Command => "COMMAND",
             Mode::Find => "FIND",
+            Mode::Switcher => "SWITCH",
             Mode::Help => "HELP",
         };
         let dirty_text = if self.dirty { "*" } else { "" };
@@ -3401,6 +3592,11 @@ impl App {
         let status_line = match self.mode {
             Mode::Search => fit_footer_left(&format!("/{}", self.search_input), footer_width),
             Mode::Command => fit_footer_left(&format!(":{}", self.command_input), footer_width),
+            Mode::Switcher => fit_footer_segments(
+                &format!("jump:{}", self.switcher_input),
+                &["Enter open", "Esc cancel", "↑↓ move"],
+                footer_width,
+            ),
             Mode::Help => fit_footer_segments(
                 &format!("[{}] {}", mode_text, self.status),
                 &["j/k scroll", "PgUp/PgDn", "Esc close"],
@@ -3456,9 +3652,84 @@ impl App {
         let status = Paragraph::new(status_line).style(status_style);
         frame.render_widget(status, layout[2]);
 
+        if self.mode == Mode::Switcher {
+            self.render_switcher_overlay(frame, palette);
+        }
+
         if self.mode == Mode::Help {
             self.render_help_overlay(frame, palette);
         }
+    }
+
+    fn render_switcher_overlay(&mut self, frame: &mut Frame, palette: Palette) {
+        let area = frame.area();
+        let w = area.width.min(72);
+        let h = area.height.min(16);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect { x, y, width: w, height: h };
+        let inner = Block::default()
+            .title(" Jump To Note ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.accent))
+            .style(Style::default().bg(palette.bg).fg(palette.text))
+            .inner(popup);
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title(" Jump To Note ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.accent))
+                .style(Style::default().bg(palette.bg).fg(palette.text)),
+            popup,
+        );
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(format!("> {}", self.switcher_input))
+                .style(Style::default().fg(palette.accent).bg(palette.bg)),
+            chunks[0],
+        );
+
+        let items: Vec<ListItem> = if self.switcher_results.is_empty() {
+            vec![ListItem::new(Line::styled(
+                "No matching notes",
+                Style::default().fg(palette.muted),
+            ))]
+        } else {
+            self.switcher_results
+                .iter()
+                .take(chunks[1].height as usize)
+                .enumerate()
+                .map(|(idx, note)| {
+                    let selected = idx == self.switcher_cursor;
+                    let style = if selected {
+                        Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.text)
+                    };
+                    let meta = if note.archived {
+                        " [archived]"
+                    } else if !note.folder.is_empty() {
+                        " [folder]"
+                    } else {
+                        ""
+                    };
+                    ListItem::new(Line::from(vec![TSpan::styled(
+                        format!("{}{}", note.title, meta),
+                        style,
+                    )]))
+                })
+                .collect()
+        };
+        let mut list_state = ratatui::widgets::ListState::default();
+        list_state.select(Some(self.switcher_cursor.min(items.len().saturating_sub(1))));
+        frame.render_stateful_widget(List::new(items), chunks[1], &mut list_state);
     }
 
 
@@ -3507,6 +3778,9 @@ impl App {
             row("/",               "search notes"),
             row(":",               "command palette"),
             row("\\",              "toggle notes pane"),
+            row("Ctrl+P",          "quick switcher"),
+            row("p / a",           "pin / archive selected note"),
+            row("A / T",           "show archived / trash"),
             row("F9",              "cycle sort"),
             row("q",               "quit"),
             pad(),
@@ -3558,6 +3832,9 @@ impl App {
             row(":theme <name>",   "neo-noir|paper|matrix"),
             row(":keymap <name>",  "default|vim"),
             row(":sort <mode>",    "manual|updated|title"),
+            row(":trash",          "show trash"),
+            row(":restore",        "restore selected trash note"),
+            row(":purge",          "permanently delete selected trash note"),
             pad(),
             Line::from(vec![dim("  F6 theme  F7 keymap  F8 density  F9 sort  "), key("?/Esc"), dim(" close")]),
             pad(),

@@ -95,6 +95,7 @@ impl Store {
             "ALTER TABLE notes ADD COLUMN tags   TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE notes ADD COLUMN note_order INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE notes ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE notes ADD COLUMN deleted_at TEXT",
         ] {
             match self.conn.execute_batch(sql) {
                 Ok(_) => {}
@@ -125,6 +126,10 @@ impl Store {
     }
 
     pub fn list_notes(&self, query: &str) -> Result<Vec<NoteSummary>> {
+        self.list_notes_internal(query, None)
+    }
+
+    pub fn list_notes_for_switcher(&self, query: &str) -> Result<Vec<NoteSummary>> {
         self.list_notes_internal(query, None)
     }
 
@@ -301,6 +306,17 @@ impl Store {
     }
 
     pub fn delete_note(&self, id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute("UPDATE notes SET deleted_at = ?1 WHERE id = ?2", params![now, id])?;
+        Ok(())
+    }
+
+    pub fn restore_note(&self, id: i64) -> Result<()> {
+        self.conn.execute("UPDATE notes SET deleted_at = NULL WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn purge_note(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
         Ok(())
     }
@@ -308,7 +324,7 @@ impl Store {
 
 impl Store {
     fn list_notes_internal(&self, query: &str, folder_scope: Option<&str>) -> Result<Vec<NoteSummary>> {
-        let (tags, folder_filter, show_archived, fts) = parse_query(query);
+        let (tags, folder_filter, show_archived, show_trash, fts) = parse_query(query);
         if let Some(scope) = folder_scope {
             if let Some(filter) = folder_filter.as_deref() {
                 if !scope.eq_ignore_ascii_case(filter) {
@@ -325,6 +341,12 @@ impl Store {
             where_clauses.push("notes_fts MATCH ?".to_string());
             bind_vals.push(fts);
         }
+
+        where_clauses.push(if show_trash {
+            "n.deleted_at IS NOT NULL".to_string()
+        } else {
+            "n.deleted_at IS NULL".to_string()
+        });
 
         where_clauses.push(if show_archived {
             "n.archived = 1".to_string()
@@ -453,16 +475,19 @@ fn extract_tags(body: &str) -> String {
     tags.join(" ")
 }
 
-/// Parse a search query into (tags, folder, show_archived, fts_text).
-fn parse_query(query: &str) -> (Vec<String>, Option<String>, bool, String) {
+/// Parse a search query into (tags, folder, show_archived, show_trash, fts_text).
+fn parse_query(query: &str) -> (Vec<String>, Option<String>, bool, bool, String) {
     let mut tags: Vec<String> = Vec::new();
     let mut folder: Option<String> = None;
     let mut show_archived = false;
+    let mut show_trash = false;
     let mut fts_tokens: Vec<String> = Vec::new();
 
     for token in query.split_whitespace() {
         if token.eq_ignore_ascii_case(":archived") {
             show_archived = true;
+        } else if token.eq_ignore_ascii_case(":trash") {
+            show_trash = true;
         } else if let Some(rest) = token.strip_prefix('#') {
             if !rest.is_empty() {
                 tags.push(rest.to_ascii_lowercase());
@@ -477,7 +502,7 @@ fn parse_query(query: &str) -> (Vec<String>, Option<String>, bool, String) {
     }
 
     let fts = fts_tokens.join(" ");
-    (tags, folder, show_archived, fts)
+    (tags, folder, show_archived, show_trash, fts)
 }
 
 #[cfg(test)]

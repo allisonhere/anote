@@ -12,6 +12,7 @@ Keyboard-first TUI note-taking app in Rust.
 - Vim and default keymaps
 - Three themes: neo-noir, paper, matrix
 - Collapsible notes pane with scrollable preview
+- Soft-delete trash and quick note switcher
 - Command palette (`:`), quick CLI capture, CLI search
 
 ## Installation
@@ -101,6 +102,11 @@ All fields are optional — missing fields fall back to the defaults above. The 
 | `/` | search / filter notes |
 | `:` | command palette |
 | `\` | toggle notes pane |
+| `Ctrl+P` | quick switcher |
+| `p` | pin / unpin note |
+| `a` | archive / unarchive note |
+| `A` | toggle archived view |
+| `T` | toggle trash view |
 | `r` | reload notes |
 | `?` | help overlay |
 | `q` | quit |
@@ -185,6 +191,9 @@ Navigation phase (after Enter):
 | `:theme <name>` | `neo-noir` \| `paper` \| `matrix` |
 | `:keymap <name>` | `default` \| `vim` |
 | `:sort <mode>` | `manual` \| `updated` \| `title` |
+| `:trash` | show trashed notes |
+| `:restore` | restore selected trash note |
+| `:purge` | permanently delete selected trash note |
 | `:reload` | refresh note list |
 | `:w` | save |
 | `:wq` / `:x` | save and quit |
