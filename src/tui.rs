@@ -53,6 +53,8 @@ enum Mode {
     Command,
     Find,
     Switcher,
+    ArchiveBrowser,
+    TrashBrowser,
     Tags,
     Help,
 }
@@ -62,6 +64,7 @@ enum TagBrowserMode {
     Browse,
     Create,
     Color,
+    DeleteConfirm,
 }
 
 #[derive(Debug, Clone)]
@@ -616,6 +619,8 @@ pub struct App {
     switcher_input: String,
     switcher_cursor: usize,
     switcher_results: Vec<NoteSummary>,
+    note_browser_cursor: usize,
+    note_browser_results: Vec<NoteSummary>,
     tag_browser_cursor: usize,
     tag_browser_entries: Vec<TagEntry>,
     tag_browser_mode: TagBrowserMode,
@@ -680,6 +685,8 @@ impl App {
             switcher_input: String::new(),
             switcher_cursor: 0,
             switcher_results: Vec::new(),
+            note_browser_cursor: 0,
+            note_browser_results: Vec::new(),
             tag_browser_cursor: 0,
             tag_browser_entries: Vec::new(),
             tag_browser_mode: TagBrowserMode::Browse,
@@ -873,6 +880,8 @@ impl App {
             Mode::Command => self.handle_command_key(key),
             Mode::Find => self.handle_find_key(key),
             Mode::Switcher => self.handle_switcher_key(key),
+            Mode::ArchiveBrowser => self.handle_archive_browser_key(key),
+            Mode::TrashBrowser => self.handle_trash_browser_key(key),
             Mode::Tags => self.handle_tags_key(key),
             Mode::Help => {
                 match key.code {
@@ -1189,6 +1198,43 @@ impl App {
         Ok(())
     }
 
+    fn open_archive_browser(&mut self) -> Result<()> {
+        self.note_browser_results = self.store.list_notes_scoped(&self.query, None, true, false)?;
+        self.note_browser_cursor = 0;
+        self.mode = Mode::ArchiveBrowser;
+        self.sync_preview_from_note_browser_cursor()?;
+        self.status = "Archive browser: U unarchive, D trash".to_string();
+        Ok(())
+    }
+
+    fn open_trash_browser(&mut self) -> Result<()> {
+        self.note_browser_results = self.store.list_notes_scoped(&self.query, None, false, true)?;
+        self.note_browser_cursor = 0;
+        self.mode = Mode::TrashBrowser;
+        self.sync_preview_from_note_browser_cursor()?;
+        self.status = "Trash browser: R restore, P purge".to_string();
+        Ok(())
+    }
+
+    fn sync_preview_from_note_browser_cursor(&mut self) -> Result<()> {
+        if let Some(summary) = self.note_browser_results.get(self.note_browser_cursor) {
+            self.active_note_id = Some(summary.id);
+            if let Some(note) = self.store.get_note(summary.id)? {
+                self.load_note_into_editor(&note.body);
+            }
+        }
+        Ok(())
+    }
+
+    fn close_note_browser(&mut self, status: &str) -> Result<()> {
+        self.mode = Mode::Normal;
+        self.note_browser_results.clear();
+        self.note_browser_cursor = 0;
+        self.sync_active_note_from_cursor()?;
+        self.status = status.to_string();
+        Ok(())
+    }
+
     fn reload_tag_metadata(&mut self) -> Result<()> {
         self.tag_color_overrides = self.store.list_tag_colors()?;
         Ok(())
@@ -1214,6 +1260,16 @@ impl App {
         self.tag_color_overrides.get(tag).map(String::as_str)
     }
 
+    fn strip_query_scope_tokens(query: &str) -> String {
+        let mut kept = Vec::new();
+        for token in query.split_whitespace() {
+            if !token.eq_ignore_ascii_case(":archived") && !token.eq_ignore_ascii_case(":trash") {
+                kept.push(token);
+            }
+        }
+        kept.join(" ")
+    }
+
     fn accept_switcher_selection(&mut self) -> Result<()> {
         let Some(selected) = self.switcher_results.get(self.switcher_cursor).cloned() else {
             self.status = "No matching note".to_string();
@@ -1223,13 +1279,6 @@ impl App {
 
         if self.dirty {
             self.save_active_note()?;
-        }
-        if selected.archived && !self.query.contains(":archived") {
-            self.query = ":archived".to_string();
-            self.refresh_notes()?;
-        } else if self.query.contains(":trash") {
-            self.query.clear();
-            self.refresh_notes()?;
         }
         self.select_by_id(selected.id);
         self.sync_active_note_from_cursor()?;
@@ -1256,11 +1305,11 @@ impl App {
     }
 
     fn in_archived_view(&self) -> bool {
-        self.query.split_whitespace().any(|token| token.eq_ignore_ascii_case(":archived"))
+        self.mode == Mode::ArchiveBrowser
     }
 
     fn in_trash_view(&self) -> bool {
-        self.query.split_whitespace().any(|token| token.eq_ignore_ascii_case(":trash"))
+        self.mode == Mode::TrashBrowser
     }
 
     fn toggle_current_selection(&mut self) {
@@ -1598,45 +1647,20 @@ impl App {
                     self.sync_active_note_from_cursor()?;
                 }
             }
+            KeyCode::Char('U') => {
+                self.status = "Unarchive is in the archive browser".to_string();
+            }
             KeyCode::Char('A') => {
-                if self.query.contains(":archived") {
-                    self.query = self.query.replace(":archived", "").trim().to_string();
-                    self.status = "Archived filter off".to_string();
-                } else if self.query.is_empty() {
-                    self.query = ":archived".to_string();
-                    self.status = "Showing archived notes".to_string();
-                } else {
-                    self.query = format!("{} :archived", self.query.trim());
-                    self.status = "Showing archived notes".to_string();
-                }
-                self.refresh_notes()?;
-                self.restore_search_cursor(0)?;
+                self.open_archive_browser()?;
             }
             KeyCode::Char('T') => {
-                if self.query.contains(":trash") {
-                    self.query = self.query.replace(":trash", "").trim().to_string();
-                    self.status = "Trash filter off".to_string();
-                } else if self.query.is_empty() {
-                    self.query = ":trash".to_string();
-                    self.status = "Showing trash".to_string();
-                } else {
-                    self.query = format!("{} :trash", self.query.trim());
-                    self.status = "Showing trash".to_string();
-                }
-                self.refresh_notes()?;
-                self.restore_search_cursor(0)?;
+                self.open_trash_browser()?;
             }
             KeyCode::Char('D') => {
                 self.apply_bulk_action("trash")?;
             }
             KeyCode::Char('R') => {
-                if self.in_trash_view() {
-                    self.apply_bulk_action("restore")?;
-                } else if self.in_archived_view() {
-                    self.apply_bulk_action("unarchive")?;
-                } else {
-                    self.status = "Restore works in trash; use archived view to unarchive".to_string();
-                }
+                self.status = "Restore is in the trash browser".to_string();
             }
             KeyCode::Char('P') => {
                 if self.in_trash_view() {
@@ -1710,7 +1734,7 @@ impl App {
                         self.status = format!("Deleted folder '{}'", name);
                     }
                     Some(TreeItem::Note(n)) => {
-                        if self.query.contains(":trash") {
+                        if self.in_trash_view() {
                             self.store.purge_note(n.id)?;
                         } else {
                             self.store.delete_note(n.id)?;
@@ -1722,7 +1746,7 @@ impl App {
                         if self.tree_cursor > 0 { self.tree_cursor -= 1; }
                         self.rebuild_tree()?;
                         self.sync_active_note_from_cursor()?;
-                        self.status = if self.query.contains(":trash") {
+                        self.status = if self.in_trash_view() {
                             "Note permanently deleted".to_string()
                         } else {
                             "Moved to trash".to_string()
@@ -2087,25 +2111,31 @@ impl App {
                 self.status = "Search canceled".to_string();
             }
             KeyCode::Enter => {
-                self.query = self.search_input.trim().to_string();
-                self.mode = Mode::Normal;
-                let result_count = self.tree.iter().filter(|item| item.is_note()).count();
-                self.status = if self.query.is_empty() {
-                    "Search cleared  (#tag /folder text)".to_string()
+                let raw = self.search_input.trim().to_string();
+                self.query = Self::strip_query_scope_tokens(&raw);
+                if raw.split_whitespace().any(|token| token.eq_ignore_ascii_case(":archived")) {
+                    self.open_archive_browser()?;
+                } else if raw.split_whitespace().any(|token| token.eq_ignore_ascii_case(":trash")) {
+                    self.open_trash_browser()?;
                 } else {
-                    format!("Search: {}  [{} result{}]", self.query, result_count, if result_count == 1 { "" } else { "s" })
-                };
+                    self.refresh_notes()?;
+                    self.mode = Mode::Normal;
+                    let result_count = self.tree.iter().filter(|item| item.is_note()).count();
+                    self.status = if self.query.is_empty() {
+                        "Search cleared  (#tag /folder text)".to_string()
+                    } else {
+                        format!("Search: {}  [{} result{}]", self.query, result_count, if result_count == 1 { "" } else { "s" })
+                    };
+                }
             }
             KeyCode::Backspace => {
                 self.search_input.pop();
-                let q = self.search_input.trim().to_string();
-                self.query = q;
+                self.query = Self::strip_query_scope_tokens(self.search_input.trim());
                 self.refresh_search_results_preserving_selection()?;
             }
             KeyCode::Char(c) => {
                 self.search_input.push(c);
-                let q = self.search_input.trim().to_string();
-                self.query = q;
+                self.query = Self::strip_query_scope_tokens(self.search_input.trim());
                 self.refresh_search_results_preserving_selection()?;
             }
             _ => {}
@@ -2146,6 +2176,90 @@ impl App {
         Ok(false)
     }
 
+    fn handle_archive_browser_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('A') => {
+                self.close_note_browser("Archive browser closed")?;
+            }
+            KeyCode::Up => {
+                self.note_browser_cursor = self.note_browser_cursor.saturating_sub(1);
+                self.sync_preview_from_note_browser_cursor()?;
+            }
+            KeyCode::Down => {
+                if self.note_browser_cursor + 1 < self.note_browser_results.len() {
+                    self.note_browser_cursor += 1;
+                    self.sync_preview_from_note_browser_cursor()?;
+                }
+            }
+            KeyCode::Char('U') | KeyCode::Char('u') | KeyCode::Char('a') => {
+                if let Some(note) = self.note_browser_results.get(self.note_browser_cursor).cloned() {
+                    self.store.set_archived(note.id, false)?;
+                    self.note_browser_results = self.store.list_notes_scoped(&self.query, None, true, false)?;
+                    if self.note_browser_cursor >= self.note_browser_results.len() {
+                        self.note_browser_cursor = self.note_browser_results.len().saturating_sub(1);
+                    }
+                    self.sync_preview_from_note_browser_cursor()?;
+                    self.status = format!("Note '{}' unarchived", note.title);
+                }
+            }
+            KeyCode::Char('D') => {
+                if let Some(note) = self.note_browser_results.get(self.note_browser_cursor).cloned() {
+                    self.store.delete_note(note.id)?;
+                    self.note_browser_results = self.store.list_notes_scoped(&self.query, None, true, false)?;
+                    if self.note_browser_cursor >= self.note_browser_results.len() {
+                        self.note_browser_cursor = self.note_browser_results.len().saturating_sub(1);
+                    }
+                    self.sync_preview_from_note_browser_cursor()?;
+                    self.status = format!("Moved '{}' to trash", note.title);
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_trash_browser_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('T') => {
+                self.close_note_browser("Trash browser closed")?;
+            }
+            KeyCode::Up => {
+                self.note_browser_cursor = self.note_browser_cursor.saturating_sub(1);
+                self.sync_preview_from_note_browser_cursor()?;
+            }
+            KeyCode::Down => {
+                if self.note_browser_cursor + 1 < self.note_browser_results.len() {
+                    self.note_browser_cursor += 1;
+                    self.sync_preview_from_note_browser_cursor()?;
+                }
+            }
+            KeyCode::Char('R') | KeyCode::Char('r') => {
+                if let Some(note) = self.note_browser_results.get(self.note_browser_cursor).cloned() {
+                    self.store.restore_note(note.id)?;
+                    self.note_browser_results = self.store.list_notes_scoped(&self.query, None, false, true)?;
+                    if self.note_browser_cursor >= self.note_browser_results.len() {
+                        self.note_browser_cursor = self.note_browser_results.len().saturating_sub(1);
+                    }
+                    self.sync_preview_from_note_browser_cursor()?;
+                    self.status = format!("Restored '{}'", note.title);
+                }
+            }
+            KeyCode::Char('P') | KeyCode::Char('p') => {
+                if let Some(note) = self.note_browser_results.get(self.note_browser_cursor).cloned() {
+                    self.store.purge_note(note.id)?;
+                    self.note_browser_results = self.store.list_notes_scoped(&self.query, None, false, true)?;
+                    if self.note_browser_cursor >= self.note_browser_results.len() {
+                        self.note_browser_cursor = self.note_browser_results.len().saturating_sub(1);
+                    }
+                    self.sync_preview_from_note_browser_cursor()?;
+                    self.status = format!("Permanently deleted '{}'", note.title);
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
     fn handle_tags_key(&mut self, key: KeyEvent) -> Result<bool> {
         match self.tag_browser_mode {
             TagBrowserMode::Browse => match key.code {
@@ -2172,6 +2286,22 @@ impl App {
                         let current = self.tag_color_overrides.get(&tag).cloned();
                         self.tag_color_cursor = tag_color_choice_index(current.as_deref());
                         self.status = format!("Color for #{}: Enter save, Esc cancel", tag);
+                    } else {
+                        self.status = "No tag selected".to_string();
+                    }
+                }
+                KeyCode::Char('D') => {
+                    if let Some((tag, count)) = self
+                        .selected_tag_entry()
+                        .map(|entry| (entry.tag.clone(), entry.count))
+                    {
+                        self.tag_browser_mode = TagBrowserMode::DeleteConfirm;
+                        self.status = format!(
+                            "Delete #{} from {} note{}? Enter confirm, Esc cancel",
+                            tag,
+                            count,
+                            if count == 1 { "" } else { "s" }
+                        );
                     } else {
                         self.status = "No tag selected".to_string();
                     }
@@ -2256,6 +2386,35 @@ impl App {
                             }
                             Err(err) => {
                                 self.status = format!("Tag color error: {}", err);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            TagBrowserMode::DeleteConfirm => match key.code {
+                KeyCode::Esc => {
+                    self.tag_browser_mode = TagBrowserMode::Browse;
+                    self.status = "Tag deletion canceled".to_string();
+                }
+                KeyCode::Enter | KeyCode::Char('D') => {
+                    if let Some(tag) = self.selected_tag_name().map(str::to_string) {
+                        match self.store.delete_tag_everywhere(&tag) {
+                            Ok(updated) => {
+                                self.reload_tag_metadata()?;
+                                self.refresh_tag_browser_entries()?;
+                                self.refresh_notes()?;
+                                self.sync_active_note_from_cursor()?;
+                                self.tag_browser_mode = TagBrowserMode::Browse;
+                                self.status = format!(
+                                    "Removed #{} from {} note{}",
+                                    tag,
+                                    updated,
+                                    if updated == 1 { "" } else { "s" }
+                                );
+                            }
+                            Err(err) => {
+                                self.status = format!("Tag delete error: {}", err);
                             }
                         }
                     }
@@ -2549,8 +2708,8 @@ impl App {
                 self.status = "Reloaded".to_string();
             }
             "search" => {
-                let query = parts.collect::<Vec<_>>().join(" ");
-                self.query = query;
+                let raw_query = parts.collect::<Vec<_>>().join(" ");
+                self.query = Self::strip_query_scope_tokens(&raw_query);
                 self.refresh_notes()?;
                 self.tree_cursor = 0;
                 self.sync_active_note_from_cursor()?;
@@ -2592,16 +2751,15 @@ impl App {
             "tags" => {
                 self.open_tag_browser()?;
             }
+            "archived" => {
+                self.open_archive_browser()?;
+            }
             "trash" => {
-                self.query = ":trash".to_string();
-                self.refresh_notes()?;
-                self.restore_search_cursor(0)?;
-                self.status = "Showing trash".to_string();
+                self.open_trash_browser()?;
             }
             "restore" => {
                 if let Some(id) = self.active_note_id {
                     self.store.restore_note(id)?;
-                    self.query = self.query.replace(":trash", "").trim().to_string();
                     self.refresh_notes()?;
                     self.select_by_id(id);
                     self.sync_active_note_from_cursor()?;
@@ -2976,9 +3134,168 @@ impl App {
         Ok(())
     }
 
+    fn selected_note_ids_in_tree_order(&self) -> Vec<i64> {
+        self.tree
+            .iter()
+            .filter_map(|item| item.note())
+            .filter(|note| self.selected_note_ids.contains(&note.id))
+            .map(|note| note.id)
+            .collect()
+    }
+
+    fn move_selected_notes(&mut self, direction: i32) -> Result<bool> {
+        let mut ids = self.selected_note_ids_in_tree_order();
+        if ids.is_empty() {
+            return Ok(false);
+        }
+
+        if direction > 0 {
+            ids.reverse();
+        }
+
+        let anchor_id = if direction < 0 {
+            *ids.first().unwrap()
+        } else {
+            *ids.last().unwrap()
+        };
+
+        let mut moved_any = false;
+        for id in &ids {
+            if let Some(cur) = self.tree.iter().position(|item| item.note().map(|n| n.id == *id).unwrap_or(false)) {
+                let Some(note) = self.tree.get(cur).and_then(|item| item.note()).cloned() else {
+                    continue;
+                };
+                if self.tree_shift_move_note(cur, note, direction)? {
+                    moved_any = true;
+                }
+            }
+        }
+
+        if moved_any {
+            if let Some(pos) = self.tree.iter().position(|item| item.note().map(|n| n.id == anchor_id).unwrap_or(false)) {
+                self.tree_cursor = pos;
+            }
+            self.sync_active_note_from_cursor()?;
+            let mut status = format!(
+                "Moved {} selected note{}",
+                ids.len(),
+                if ids.len() == 1 { "" } else { "s" }
+            );
+            if self.sort_mode == SortMode::Manual {
+                status.push_str(" (manual sort)");
+            }
+            self.status = status;
+        } else {
+            self.status = "Selected notes can't move further".to_string();
+        }
+
+        Ok(true)
+    }
+
+    fn tree_shift_move_note(&mut self, cur: usize, note: NoteSummary, direction: i32) -> Result<bool> {
+        let note_folder = note.folder.clone();
+        let note_id = note.id;
+
+        let target_idx = if direction < 0 {
+            if cur == 0 { return Ok(false); }
+            cur - 1
+        } else {
+            if cur + 1 >= self.tree.len() { return Ok(false); }
+            cur + 1
+        };
+
+        match self.tree.get(target_idx).cloned() {
+            Some(TreeItem::Note(other_note)) if other_note.folder == note_folder => {
+                if note.note_order == other_note.note_order {
+                    self.normalize_note_orders_in_group(&note_folder)?;
+                }
+                self.store.swap_note_order(note_id, other_note.id)?;
+                self.rebuild_tree()?;
+                self.tree_cursor = target_idx;
+                Ok(true)
+            }
+            Some(TreeItem::Note(other_note)) => {
+                let dest_folder = other_note.folder.clone();
+                if note.note_order == other_note.note_order {
+                    self.normalize_note_orders_in_group(&dest_folder)?;
+                }
+                self.store.set_folder(note_id, &dest_folder)?;
+                self.store.swap_note_order(note_id, other_note.id)?;
+                self.rebuild_tree()?;
+                self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                Ok(true)
+            }
+            Some(TreeItem::Folder { name: ref folder_name, .. }) => {
+                let folder_name = folder_name.clone();
+                let folder_sort_order = self
+                    .store
+                    .list_folders()?
+                    .into_iter()
+                    .find(|folder| folder.name == folder_name)
+                    .map(|folder| folder.sort_order)
+                    .unwrap_or(0);
+                if direction < 0 {
+                    if target_idx == 0 {
+                        self.store.set_folder(note_id, "")?;
+                        self.store.set_note_order(note_id, folder_sort_order - 1)?;
+                        self.rebuild_tree()?;
+                        self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                    } else {
+                        match self.tree.get(target_idx - 1).cloned() {
+                            Some(TreeItem::Note(prev_note)) => {
+                                let prev_folder = prev_note.folder.clone();
+                                if note.note_order == prev_note.note_order {
+                                    self.normalize_note_orders_in_group(&prev_folder)?;
+                                }
+                                self.store.set_folder(note_id, &prev_folder)?;
+                                self.store.swap_note_order(note_id, prev_note.id)?;
+                                self.rebuild_tree()?;
+                                self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                            }
+                            _ => {
+                                self.store.set_folder(note_id, "")?;
+                                self.store.set_note_order(note_id, folder_sort_order - 1)?;
+                                self.rebuild_tree()?;
+                                self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                            }
+                        }
+                    }
+                } else {
+                    self.tree_expanded.insert(folder_name.clone());
+                    self.store.set_folder(note_id, &folder_name)?;
+                    self.rebuild_tree()?;
+                    self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn tree_shift_move(&mut self, direction: i32) -> Result<()> {
         let cur = self.tree_cursor;
         if self.tree.is_empty() { return Ok(()); }
+
+        let switched_to_manual = if self.sort_mode != SortMode::Manual {
+            self.sort_mode = SortMode::Manual;
+            self.persist_preferences();
+            self.refresh_notes()?;
+            if let Some(id) = self.active_note_id {
+                self.select_by_id(id);
+            }
+            self.sync_active_note_from_cursor()?;
+            true
+        } else {
+            false
+        };
+
+        if !self.selected_note_ids_in_view().is_empty() {
+            self.move_selected_notes(direction)?;
+            if switched_to_manual && !self.status.contains("manual sort") {
+                self.status.push_str(" (manual sort)");
+            }
+            return Ok(());
+        }
 
         match self.tree.get(cur).cloned() {
             Some(TreeItem::Folder { name: folder_name, .. }) => {
@@ -3000,81 +3317,9 @@ impl App {
                 }
             }
             Some(TreeItem::Note(note)) => {
-                let note_folder = note.folder.clone();
-                let note_id = note.id;
-
-                let target_idx = if direction < 0 {
-                    if cur == 0 { return Ok(()); }
-                    cur - 1
-                } else {
-                    if cur + 1 >= self.tree.len() { return Ok(()); }
-                    cur + 1
-                };
-
-                match self.tree.get(target_idx).cloned() {
-                    Some(TreeItem::Note(other_note)) if other_note.folder == note_folder => {
-                        if note.note_order == other_note.note_order {
-                            self.normalize_note_orders_in_group(&note_folder)?;
-                        }
-                        self.store.swap_note_order(note_id, other_note.id)?;
-                        self.rebuild_tree()?;
-                        self.tree_cursor = target_idx;
-                    }
-                    Some(TreeItem::Note(other_note)) => {
-                        let dest_folder = other_note.folder.clone();
-                        if note.note_order == other_note.note_order {
-                            self.normalize_note_orders_in_group(&dest_folder)?;
-                        }
-                        self.store.set_folder(note_id, &dest_folder)?;
-                        self.store.swap_note_order(note_id, other_note.id)?;
-                        self.rebuild_tree()?;
-                        self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
-                    }
-                    Some(TreeItem::Folder { name: ref folder_name, .. }) => {
-                        let folder_name = folder_name.clone();
-                        let folder_sort_order = self
-                            .store
-                            .list_folders()?
-                            .into_iter()
-                            .find(|folder| folder.name == folder_name)
-                            .map(|folder| folder.sort_order)
-                            .unwrap_or(0);
-                        if direction < 0 {
-                            // Moving up past a folder: move note to root, before the folder
-                            if target_idx == 0 {
-                                self.store.set_folder(note_id, "")?;
-                                self.store.set_note_order(note_id, folder_sort_order - 1)?;
-                                self.rebuild_tree()?;
-                                self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
-                            } else {
-                                match self.tree.get(target_idx - 1).cloned() {
-                                    Some(TreeItem::Note(prev_note)) => {
-                                        let prev_folder = prev_note.folder.clone();
-                                        if note.note_order == prev_note.note_order {
-                                            self.normalize_note_orders_in_group(&prev_folder)?;
-                                        }
-                                        self.store.set_folder(note_id, &prev_folder)?;
-                                        self.store.swap_note_order(note_id, prev_note.id)?;
-                                        self.rebuild_tree()?;
-                                        self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
-                                    }
-                                    _ => {
-                                        self.store.set_folder(note_id, "")?;
-                                        self.store.set_note_order(note_id, folder_sort_order - 1)?;
-                                        self.rebuild_tree()?;
-                                        self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
-                                    }
-                                }
-                            }
-                        } else {
-                            // Moving down past a folder: move note into that folder
-                            self.tree_expanded.insert(folder_name.clone());
-                            self.store.set_folder(note_id, &folder_name)?;
-                            self.rebuild_tree()?;
-                            self.tree_cursor = self.tree.iter().position(|i| i.note().map(|n| n.id == note_id).unwrap_or(false)).unwrap_or(0);
-                        }
-                    }
-                    None => {}
+                self.tree_shift_move_note(cur, note, direction)?;
+                if switched_to_manual {
+                    self.status = "Moved note (manual sort)".to_string();
                 }
             }
             None => {}
@@ -3814,10 +4059,6 @@ impl App {
             if tree_len == 0 && self.tree_inline_mode != TreeInlineMode::CreateFolder {
                 let empty_message = if self.query.is_empty() {
                     "No notes yet. Press 'n' to create or 'f' for a folder.".to_string()
-                } else if self.query.contains(":trash") {
-                    format!("Trash is empty for '{}'. Press 'T' to leave trash.", self.query)
-                } else if self.query.contains(":archived") {
-                    format!("No archived notes match '{}'. Press '/' to refine.", self.query)
                 } else {
                     format!("No notes match '{}'. Press '/' to refine or clear the search.", self.query)
                 };
@@ -4009,6 +4250,8 @@ impl App {
             Mode::Command => " Preview ",
             Mode::Find => " Edit (find) ",
             Mode::Switcher => " Preview ",
+            Mode::ArchiveBrowser => " Preview ",
+            Mode::TrashBrowser => " Preview ",
             Mode::Tags => " Preview ",
             Mode::Help => " Preview ",
         };
@@ -4111,6 +4354,8 @@ impl App {
             Mode::Command => "COMMAND",
             Mode::Find => "FIND",
             Mode::Switcher => "SWITCH",
+            Mode::ArchiveBrowser => "ARCHIVE",
+            Mode::TrashBrowser => "TRASH",
             Mode::Tags => "TAGS",
             Mode::Help => "HELP",
         };
@@ -4136,11 +4381,21 @@ impl App {
                 &["Enter open", "Esc cancel", "↑↓ move"],
                 footer_width,
             ),
+            Mode::ArchiveBrowser => fit_footer_segments(
+                "[ARCHIVE] browser",
+                &["↑↓ move", "U unarchive", "D trash", "Esc close"],
+                footer_width,
+            ),
+            Mode::TrashBrowser => fit_footer_segments(
+                "[TRASH] browser",
+                &["↑↓ move", "R restore", "P purge", "Esc close"],
+                footer_width,
+            ),
             Mode::Tags => {
                 let (left, hints): (String, Vec<&str>) = match self.tag_browser_mode {
                     TagBrowserMode::Browse => (
                         "[TAGS] browse tags".to_string(),
-                        vec!["Enter filter", "n new", "c color", "Esc close"],
+                        vec!["Enter filter", "n new", "c color", "D delete", "Esc close"],
                     ),
                     TagBrowserMode::Create => (
                         format!("[TAGS] new #{}", self.tag_browser_input),
@@ -4149,6 +4404,10 @@ impl App {
                     TagBrowserMode::Color => (
                         "[TAGS] choose color".to_string(),
                         vec!["←→ pick", "Enter save", "Esc cancel"],
+                    ),
+                    TagBrowserMode::DeleteConfirm => (
+                        "[TAGS] delete tag".to_string(),
+                        vec!["Enter confirm", "D confirm", "Esc cancel"],
                     ),
                 };
                 fit_footer_segments(&left, &hints, footer_width)
@@ -4180,20 +4439,12 @@ impl App {
                         vec!["a confirm", "any key cancel"]
                     } else if self.delete_pending {
                         vec!["d confirm", "any key cancel"]
-                    } else if selected_count > 0 && self.in_trash_view() {
-                        vec!["R restore", "P purge", "u clear"]
-                    } else if selected_count > 0 && self.in_archived_view() {
-                        vec!["a unarchive", "R unarchive", "D trash", "u clear"]
                     } else if selected_count > 0 {
                         vec!["a archive", "D trash", "p pin", "u clear"]
                     } else if self.notes_pane_collapsed {
                         vec!["j/k scroll", "PgUp/PgDn", "\\ notes", "F9 sort", "? help", "q quit"]
-                    } else if self.in_trash_view() {
-                        vec!["R restore", "P purge", ":empty-trash", "T exit trash", "? help"]
-                    } else if self.in_archived_view() {
-                        vec!["a unarchive", "R unarchive", "A exit archived", "? help"]
                     } else {
-                        vec![": command", "x mark", "* all", "g tags", "/ search", "F9 sort", "? help"]
+                        vec![": command", "x mark", "* all", "A archive", "T trash", "g tags", "/ search", "F9 sort"]
                     };
                     fit_footer_segments(&left, &hints, footer_width)
                 }
@@ -4222,6 +4473,10 @@ impl App {
 
         if self.mode == Mode::Switcher {
             self.render_switcher_overlay(frame, palette);
+        }
+
+        if matches!(self.mode, Mode::ArchiveBrowser | Mode::TrashBrowser) {
+            self.render_note_browser_overlay(frame, palette);
         }
 
         if self.mode == Mode::Tags {
@@ -4345,17 +4600,17 @@ impl App {
         );
     }
 
-    fn render_tag_browser_overlay(&mut self, frame: &mut Frame, palette: Palette) {
+    fn render_note_browser_overlay(&mut self, frame: &mut Frame, palette: Palette) {
         let area = frame.area();
-        let w = area.width.min(60);
-        let h = area.height.min(22);
+        let w = area.width.min(72);
+        let h = area.height.min(18);
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = area.y + (area.height.saturating_sub(h)) / 2;
         let popup = Rect { x, y, width: w, height: h };
-        let title = match self.tag_browser_mode {
-            TagBrowserMode::Browse => " Tags ",
-            TagBrowserMode::Create => " Tags • New ",
-            TagBrowserMode::Color => " Tags • Color ",
+        let title = if self.mode == Mode::ArchiveBrowser {
+            " Archive Browser "
+        } else {
+            " Trash Browser "
         };
         let block = Block::default()
             .title(title)
@@ -4368,7 +4623,114 @@ impl App {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(6), Constraint::Length(4)])
+            .constraints([Constraint::Min(6), Constraint::Length(3)])
+            .split(inner);
+
+        let items: Vec<ListItem> = if self.note_browser_results.is_empty() {
+            vec![ListItem::new(Line::styled(
+                if self.mode == Mode::ArchiveBrowser {
+                    "No archived notes"
+                } else {
+                    "Trash is empty"
+                },
+                Style::default().fg(palette.muted),
+            ))]
+        } else {
+            self.note_browser_results
+                .iter()
+                .enumerate()
+                .map(|(idx, note)| {
+                    let selected = idx == self.note_browser_cursor;
+                    let rail_style = if selected {
+                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.bg)
+                    };
+                    let title_style = if selected {
+                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.text)
+                    };
+                    let meta_style = if selected {
+                        Style::default().fg(palette.text)
+                    } else {
+                        Style::default().fg(palette.muted)
+                    };
+                    let meta = if note.folder.is_empty() {
+                        short_timestamp(&note.updated_at)
+                    } else {
+                        format!("/{}  {}", note.folder, short_timestamp(&note.updated_at))
+                    };
+                    ListItem::new(Text::from(vec![
+                        Line::from(vec![
+                            TSpan::styled(if selected { "▍ " } else { "  " }, rail_style),
+                            TSpan::styled(note.title.clone(), title_style),
+                        ]),
+                        Line::from(vec![TSpan::styled(format!("  {}", meta), meta_style)]),
+                    ]))
+                })
+                .collect()
+        };
+        let mut list_state = ratatui::widgets::ListState::default();
+        list_state.select(Some(self.note_browser_cursor.min(items.len().saturating_sub(1))));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default()),
+            chunks[0],
+            &mut list_state,
+        );
+
+        let detail_lines = if let Some(note) = self.note_browser_results.get(self.note_browser_cursor) {
+            let action = if self.mode == Mode::ArchiveBrowser {
+                "U unarchive  D trash"
+            } else {
+                "R restore  P purge"
+            };
+            vec![
+                Line::from(vec![
+                    TSpan::styled(note.title.clone(), Style::default().fg(palette.text).add_modifier(Modifier::BOLD)),
+                    TSpan::styled(format!("  {}", action), Style::default().fg(palette.muted)),
+                ]),
+                Line::styled(
+                    if note.snippet.is_empty() { short_timestamp(&note.updated_at) } else { note.snippet.replace(['[', ']'], "") },
+                    Style::default().fg(palette.muted),
+                ),
+            ]
+        } else {
+            vec![Line::styled("Esc closes the browser", Style::default().fg(palette.muted))]
+        };
+        frame.render_widget(Paragraph::new(detail_lines), chunks[1]);
+    }
+
+    fn render_tag_browser_overlay(&mut self, frame: &mut Frame, palette: Palette) {
+        let area = frame.area();
+        let w = area.width.min(60);
+        let h = area.height.min(22);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect { x, y, width: w, height: h };
+        let title = match self.tag_browser_mode {
+            TagBrowserMode::Browse => " Tags ",
+            TagBrowserMode::Create => " Tags • New ",
+            TagBrowserMode::Color => " Tags • Color ",
+            TagBrowserMode::DeleteConfirm => " Tags • Delete ",
+        };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.accent))
+            .style(Style::default().bg(palette.bg).fg(palette.text));
+        let inner = block.inner(popup);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(block, popup);
+
+        let detail_height = match self.tag_browser_mode {
+            TagBrowserMode::Color => 10,
+            TagBrowserMode::DeleteConfirm => 5,
+            _ => 4,
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(detail_height)])
             .split(inner);
 
         let items: Vec<ListItem> = if self.tag_browser_entries.is_empty() {
@@ -4458,30 +4820,89 @@ impl App {
             TagBrowserMode::Color => {
                 let choices = self.theme.tag_color_choices();
                 let current_name = self.selected_tag_name().unwrap_or("");
-                let mut palette_line = vec![
-                    TSpan::styled("auto", color_choice_style(self.tag_color_cursor == 0, palette)),
-                ];
-                for (idx, choice) in choices.iter().enumerate() {
-                    palette_line.push(TSpan::raw(" "));
-                    let selected = self.tag_color_cursor == idx + 1;
-                    for span in color_choice_spans(*choice, self.theme, selected, palette.bg) {
-                        palette_line.push(span);
-                    }
-                }
-
                 let label = if self.tag_color_cursor == 0 {
                     "auto".to_string()
                 } else {
                     choices[self.tag_color_cursor - 1].label.to_string()
                 };
+                let preview_color = if self.tag_color_cursor == 0 {
+                    None
+                } else {
+                    Some(choices[self.tag_color_cursor - 1].key)
+                };
 
-                vec![
+                let mut lines = vec![
                     Line::from(vec![
                         TSpan::styled(format!("Color for #{} ", current_name), Style::default().fg(palette.muted)),
                         TSpan::styled(label, Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)),
                     ]),
-                    Line::from(palette_line),
-                ]
+                    Line::from(vec![
+                        TSpan::styled("Preview ", Style::default().fg(palette.muted)),
+                        TSpan::raw(" "),
+                        TSpan::styled("← →", Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)),
+                        TSpan::styled(" choose  Enter save  Esc cancel", Style::default().fg(palette.muted)),
+                    ]),
+                    Line::from(tag_pill_spans(
+                        self.theme,
+                        current_name,
+                        preview_color,
+                        palette.bg,
+                    )),
+                    Line::raw(""),
+                ];
+
+                let mut option_rows = vec![
+                    vec![Some(0usize), Some(1usize)],
+                    vec![Some(2usize), Some(3usize)],
+                    vec![Some(4usize), Some(5usize)],
+                    vec![Some(6usize), Some(7usize)],
+                    vec![Some(8usize), None],
+                ];
+
+                for row in option_rows.drain(..) {
+                    let mut spans = Vec::new();
+                    for (col_idx, opt_idx) in row.into_iter().enumerate() {
+                        if col_idx > 0 {
+                            spans.push(TSpan::raw("   "));
+                        }
+                        spans.extend(color_choice_entry_spans(
+                            self.theme,
+                            palette,
+                            opt_idx,
+                            self.tag_color_cursor,
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                }
+
+                lines
+            }
+            TagBrowserMode::DeleteConfirm => {
+                if let Some(entry) = self.selected_tag_entry() {
+                    vec![
+                        Line::from(vec![
+                            TSpan::styled("Delete ", Style::default().fg(palette.muted)),
+                            TSpan::styled(
+                                format!("#{}", entry.tag),
+                                Style::default().fg(palette.danger).add_modifier(Modifier::BOLD),
+                            ),
+                            TSpan::styled(
+                                format!(" from {} note{}?", entry.count, if entry.count == 1 { "" } else { "s" }),
+                                Style::default().fg(palette.muted),
+                            ),
+                        ]),
+                        Line::styled(
+                            "This removes the tag from the first line of every matching note and deletes its saved color.",
+                            Style::default().fg(palette.muted),
+                        ),
+                        Line::styled(
+                            "Press Enter or D to confirm. Esc cancels.",
+                            Style::default().fg(palette.danger),
+                        ),
+                    ]
+                } else {
+                    vec![Line::styled("No tag selected", Style::default().fg(palette.muted))]
+                }
             }
         };
 
@@ -4541,7 +4962,7 @@ impl App {
             row("g",               "browse and manage tags"),
             row("x / * / u",       "mark / all / clear"),
             row("p",               "pin / unpin selected note"),
-            row("A / T",           "toggle archived / trash view"),
+            row("A / T",           "open archive / trash browser"),
             row("F9",              "cycle sort"),
             row("q",               "quit"),
             pad(),
@@ -4575,25 +4996,28 @@ impl App {
             heading("  SEARCH  (/)"),
             row("#tag",            "filter by tag (first line of note)"),
             row("/folder",         "filter by folder"),
-            row(":archived",       "show archived"),
-            row(":trash",          "show trash"),
+            row(":archived",       "open archive browser on Enter"),
+            row(":trash",          "open trash browser on Enter"),
             pad(),
             heading("  TAG BROWSER"),
+            row("g / :tags",       "open tag browser"),
             row("Enter",           "filter notes by selected tag"),
             row("n",               "create a new tag"),
             row("c / e",           "choose a color for selected tag"),
+            row("D",               "delete tag from all notes (confirm)"),
             row("Esc",             "close browser / cancel tag edit"),
             pad(),
             heading("  TRASH / ARCHIVE"),
-            row("a",               "archive, confirm archive, or unarchive"),
-            row("A",               "toggle archived view"),
-            row("T",               "toggle trash view"),
+            row("a",               "archive current note"),
+            row("A",               "open archive browser"),
+            row("T",               "open trash browser"),
             row("D",               "move selected note(s) to trash"),
-            row("R",               "restore from trash / unarchive in archived view"),
-            row("P",               "permanently delete selected note(s) in trash"),
+            row("U / D",           "unarchive / trash in archive browser"),
+            row("R / P",           "restore / purge in trash browser"),
             row(":archive / :archive!", "archive current note / force confirm"),
             row(":unarchive",      "restore archived note"),
-            row(":trash",          "show trash"),
+            row(":archived",       "open archive browser"),
+            row(":trash",          "open trash browser"),
             row(":restore",        "restore selected trash note"),
             row(":purge",          "permanently delete selected trash note"),
             row(":empty-trash",    "permanently delete all trashed notes"),
@@ -4615,6 +5039,7 @@ impl App {
             row(":keymap <name>",  "default|vim"),
             row(":sort <mode>",    "manual|updated|title"),
             row(":tags",           "browse and manage tags"),
+            row(":archived",       "open archive browser"),
             pad(),
             Line::from(vec![dim("  F6 theme  F7 keymap  F8 density  F9 sort  "), key("?/Esc"), dim(" close")]),
             pad(),
@@ -4771,30 +5196,58 @@ fn tag_pill_spans(theme: ThemeName, tag: &str, color_key: Option<&str>, row_bg: 
     ]
 }
 
-fn color_choice_style(selected: bool, palette: Palette) -> Style {
-    let mut style = Style::default().fg(palette.muted);
-    if selected {
-        style = style.fg(palette.accent).add_modifier(Modifier::BOLD);
-    }
-    style
-}
-
-fn color_choice_spans(
-    choice: TagColorChoice,
+fn color_choice_entry_spans(
     theme: ThemeName,
-    selected: bool,
-    row_bg: Color,
+    palette: Palette,
+    choice_idx: Option<usize>,
+    selected_idx: usize,
 ) -> Vec<TSpan<'static>> {
-    let mut spans = tag_pill_spans(theme, choice.key, Some(choice.key), row_bg);
-    spans.push(TSpan::styled(
-        format!(" {}", choice.label),
-        if selected {
-            Style::default().fg(choice.colors(theme).0).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(choice.colors(theme).0)
-        },
-    ));
-    spans
+    match choice_idx {
+        None => vec![TSpan::raw("")],
+        Some(0) => {
+            let selected = selected_idx == 0;
+            vec![
+                TSpan::styled(
+                    if selected { "› " } else { "  " },
+                    if selected {
+                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.bg)
+                    },
+                ),
+                TSpan::styled(
+                    "auto",
+                    if selected {
+                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.muted)
+                    },
+                ),
+            ]
+        }
+        Some(idx) => {
+            let choice = TAG_COLOR_CHOICES[idx - 1];
+            let selected = selected_idx == idx;
+            let mut spans = vec![TSpan::styled(
+                if selected { "› " } else { "  " },
+                if selected {
+                    Style::default().fg(choice.colors(theme).0).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.bg)
+                },
+            )];
+            spans.extend(tag_pill_spans(theme, choice.key, Some(choice.key), palette.bg));
+            spans.push(TSpan::styled(
+                format!(" {}", choice.label),
+                if selected {
+                    Style::default().fg(choice.colors(theme).0).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.text)
+                },
+            ));
+            spans
+        }
+    }
 }
 
 fn short_timestamp(ts: &str) -> String {
@@ -5565,5 +6018,35 @@ mod tests {
         app.rebuild_tree().unwrap();
         assert_eq!(app.tree.len(), 1, "collapsed again: only folder header");
         assert!(matches!(app.tree[0], TreeItem::Folder { expanded: false, .. }));
+    }
+
+    #[test]
+    fn selected_notes_move_together_down() {
+        use crate::storage::Store;
+        use super::{App, TreeItem};
+
+        let store = Store::open_for_test().unwrap();
+        let a = store.create_note("A", "").unwrap();
+        let b = store.create_note("B", "").unwrap();
+        let c = store.create_note("C", "").unwrap();
+        store.set_note_order(a, 10).unwrap();
+        store.set_note_order(b, 20).unwrap();
+        store.set_note_order(c, 30).unwrap();
+
+        let mut app = App::new(store).unwrap();
+        app.selected_note_ids.insert(a);
+        app.selected_note_ids.insert(b);
+
+        app.move_selected_notes(1).unwrap();
+
+        let titles: Vec<String> = app
+            .tree
+            .iter()
+            .filter_map(|item| match item {
+                TreeItem::Note(note) => Some(note.title.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, vec!["C", "A", "B"]);
     }
 }

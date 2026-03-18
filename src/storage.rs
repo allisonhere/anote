@@ -143,15 +143,35 @@ impl Store {
     }
 
     pub fn list_notes(&self, query: &str) -> Result<Vec<NoteSummary>> {
-        self.list_notes_internal(query, None)
+        self.list_notes_scoped(query, None, false, false)
     }
 
     pub fn list_notes_for_switcher(&self, query: &str) -> Result<Vec<NoteSummary>> {
-        self.list_notes_internal(query, None)
+        self.list_notes_scoped(query, None, false, false)
     }
 
     pub fn list_notes_in_folder(&self, folder: &str, query: &str) -> Result<Vec<NoteSummary>> {
-        self.list_notes_internal(query, Some(folder))
+        self.list_notes_scoped(query, Some(folder), false, false)
+    }
+
+    pub fn list_notes_scoped(
+        &self,
+        query: &str,
+        folder_scope: Option<&str>,
+        show_archived: bool,
+        show_trash: bool,
+    ) -> Result<Vec<NoteSummary>> {
+        self.list_notes_internal(query, folder_scope, show_archived, show_trash)
+    }
+
+    pub fn list_notes_in_folder_scoped(
+        &self,
+        folder: &str,
+        query: &str,
+        show_archived: bool,
+        show_trash: bool,
+    ) -> Result<Vec<NoteSummary>> {
+        self.list_notes_internal(query, Some(folder), show_archived, show_trash)
     }
 
     pub fn list_tags(&self) -> Result<Vec<TagEntry>> {
@@ -411,11 +431,45 @@ impl Store {
         )?;
         Ok(normalized)
     }
+
+    pub fn delete_tag_everywhere(&self, tag: &str) -> Result<usize> {
+        let normalized = normalize_tag_name(tag)?;
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, body
+                 FROM notes
+                 WHERE (' ' || tags || ' ') LIKE ?1"
+            )?;
+            stmt.query_map([format!("% {} %", normalized)], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut updated = 0usize;
+        for (id, body) in rows {
+            let new_body = remove_tag_from_body(&body, &normalized);
+            if new_body != body {
+                self.update_note(id, &new_body)?;
+                updated += 1;
+            }
+        }
+
+        self.conn.execute("DELETE FROM tag_meta WHERE name = ?1", params![normalized])?;
+        Ok(updated)
+    }
 }
 
 impl Store {
-    fn list_notes_internal(&self, query: &str, folder_scope: Option<&str>) -> Result<Vec<NoteSummary>> {
-        let (tags, folder_filter, show_archived, show_trash, fts) = parse_query(query);
+    fn list_notes_internal(
+        &self,
+        query: &str,
+        folder_scope: Option<&str>,
+        forced_archived: bool,
+        forced_trash: bool,
+    ) -> Result<Vec<NoteSummary>> {
+        let (tags, folder_filter, query_archived, query_trash, fts) = parse_query(query);
+        let show_archived = forced_archived || query_archived;
+        let show_trash = forced_trash || query_trash;
         if let Some(scope) = folder_scope {
             if let Some(filter) = folder_filter.as_deref() {
                 if !scope.eq_ignore_ascii_case(filter) {
@@ -584,6 +638,90 @@ fn extract_tags(body: &str) -> String {
     tags.join(" ")
 }
 
+fn is_tag_boundary(c: char) -> bool {
+    !c.is_ascii_alphanumeric() && c != '_' && c != '-'
+}
+
+fn remove_tag_from_body(body: &str, tag: &str) -> String {
+    let mut lines: Vec<String> = body.lines().map(|line| line.to_string()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let first_line = lines[0].clone();
+    let lower = first_line.to_ascii_lowercase();
+    let needle = format!("#{}", tag);
+    let mut remove_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0;
+
+    while pos < lower.len() {
+        if let Some(found) = lower[pos..].find(&needle) {
+            let abs = pos + found;
+            let after = abs + needle.len();
+            let prev_ok = if abs == 0 {
+                true
+            } else {
+                lower[..abs]
+                    .chars()
+                    .next_back()
+                    .map(is_tag_boundary)
+                    .unwrap_or(true)
+            };
+            let next_ok = lower[after..]
+                .chars()
+                .next()
+                .map(is_tag_boundary)
+                .unwrap_or(true);
+            if prev_ok && next_ok {
+                let start = first_line[..abs]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| !c.is_whitespace())
+                    .map(|(idx, _)| idx + first_line[idx..].chars().next().unwrap().len_utf8())
+                    .unwrap_or(abs);
+                let trim_start = first_line[..start]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| c.is_whitespace())
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(abs);
+                let remove_start = if trim_start < abs { trim_start } else { abs };
+
+                let mut remove_end = after;
+                while let Some(ch) = first_line[remove_end..].chars().next() {
+                    if ch.is_whitespace() {
+                        remove_end += ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                remove_ranges.push((remove_start, remove_end));
+            }
+            pos = after;
+        } else {
+            break;
+        }
+    }
+
+    if remove_ranges.is_empty() {
+        return body.to_string();
+    }
+
+    let mut rebuilt = String::new();
+    let mut cursor = 0;
+    for (start, end) in remove_ranges {
+        if start > cursor {
+            rebuilt.push_str(&first_line[cursor..start]);
+        }
+        cursor = end;
+    }
+    if cursor < first_line.len() {
+        rebuilt.push_str(&first_line[cursor..]);
+    }
+    lines[0] = rebuilt.split_whitespace().collect::<Vec<_>>().join(" ");
+    lines.join("\n")
+}
+
 /// Parse a search query into (tags, folder, show_archived, show_trash, fts_text).
 fn parse_query(query: &str) -> (Vec<String>, Option<String>, bool, bool, String) {
     let mut tags: Vec<String> = Vec::new();
@@ -692,5 +830,25 @@ mod tests {
         let colors = store.list_tag_colors().unwrap();
         assert_eq!(colors.get("rust").map(String::as_str), Some("teal"));
         assert_eq!(colors.get("idea").map(String::as_str), Some("purple"));
+    }
+
+    #[test]
+    fn delete_tag_everywhere_removes_tag_from_notes_and_meta() {
+        let store = Store::open_for_test().unwrap();
+        let id_a = store.create_note("Untitled", "alpha #rust #work\nbody").unwrap();
+        let id_b = store.create_note("Untitled", "beta #rust\nbody").unwrap();
+        store.set_tag_color("rust", Some("teal")).unwrap();
+
+        let updated = store.delete_tag_everywhere("rust").unwrap();
+        assert_eq!(updated, 2);
+
+        let note_a = store.get_note(id_a).unwrap().unwrap();
+        let note_b = store.get_note(id_b).unwrap().unwrap();
+        assert!(!note_a.body.contains("#rust"));
+        assert!(!note_b.body.contains("#rust"));
+        assert!(note_a.body.contains("#work"));
+
+        let tags = store.list_tags().unwrap();
+        assert!(tags.iter().all(|entry| entry.tag != "rust"));
     }
 }

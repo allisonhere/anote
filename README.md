@@ -112,11 +112,9 @@ All fields are optional — missing fields fall back to the defaults above. The 
 | `u` | clear selection |
 | `p` | pin / unpin note |
 | `a` | archive / unarchive note |
-| `A` | toggle archived view |
-| `T` | toggle trash view |
+| `A` | open archive browser |
+| `T` | open trash browser |
 | `D` | move selected note(s) to trash |
-| `R` | restore selected note(s) |
-| `P` | permanently delete selected note(s) |
 | `r` | reload notes |
 | `?` | help overlay |
 | `q` | quit |
@@ -172,8 +170,8 @@ Navigation phase (after Enter):
 |-------|--------|
 | `#tag` | filter by tag |
 | `/folder` | filter by folder |
-| `:archived` | show archived notes |
-| `:trash` | show trashed notes |
+| `:archived` | open archive browser on Enter |
+| `:trash` | open trash browser on Enter |
 | plain text | full-text search |
 
 ### Tag browser (`g` or `:tags`)
@@ -183,6 +181,7 @@ Navigation phase (after Enter):
 | `Enter` | filter notes by selected tag |
 | `n` | create a new tag |
 | `c` / `e` | choose a color for selected tag |
+| `D` | delete the tag from all notes, with confirmation |
 | `Esc` | close browser or cancel tag editing |
 
 ## Trash / Archive
@@ -190,15 +189,18 @@ Navigation phase (after Enter):
 | Key / Command | Action |
 |---------------|--------|
 | `a` | archive, confirm archive, or unarchive the current note |
-| `A` | toggle archived view |
-| `T` | toggle trash view |
+| `A` | open archive browser |
+| `T` | open trash browser |
 | `D` | move selected note(s) to trash |
-| `R` | restore from trash, or unarchive in archived view |
-| `P` | permanently delete selected note(s) in trash |
+| `U` | unarchive in archive browser |
+| `D` | move archived note to trash in archive browser |
+| `R` | restore in trash browser |
+| `P` | purge in trash browser |
 | `:archive` | arm archive confirmation for the current note |
 | `:archive!` | confirm and archive immediately |
 | `:unarchive` | restore an archived note |
-| `:trash` | show trash |
+| `:archived` | open archive browser |
+| `:trash` | open trash browser |
 | `:restore` | restore the selected trash note |
 | `:purge` | permanently delete the selected trash note |
 | `:empty-trash` | permanently delete all trashed notes |
@@ -230,6 +232,7 @@ Navigation phase (after Enter):
 | `:keymap <name>` | `default` \| `vim` |
 | `:sort <mode>` | `manual` \| `updated` \| `title` |
 | `:tags` | browse and manage tags |
+| `:archived` | open archive browser |
 | `:reload` | refresh note list |
 | `:w` | save |
 | `:wq` / `:x` | save and quit |
@@ -239,6 +242,6 @@ Navigation phase (after Enter):
 
 Write `#tagname` on the first line of a note — tags are extracted automatically and searchable with `#tag` in the search bar.
 
-Open the tag browser with `g` or `:tags`, then use `n` to create a tag and `c` or `e` to choose its color. Created tags can exist before they are applied to a note, and chosen colors persist across restarts.
+Open the tag browser with `g` or `:tags`, then use `n` to create a tag, `c` or `e` to choose its color, and `D` to remove a tag from every note that uses it. Created tags can exist before they are applied to a note, and chosen colors persist across restarts.
 
 Tags are displayed as colored pills in the note header, quick switcher, and tag browser. The pill caps use Nerd Font powerline glyphs (`\uE0B6`/`\uE0B4`) — install a [Nerd Font](https://www.nerdfonts.com/) and set it as your terminal font for the best appearance.
