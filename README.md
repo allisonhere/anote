@@ -13,6 +13,9 @@ Keyboard-first TUI note-taking app in Rust.
 - Three themes: neo-noir, paper, matrix
 - Collapsible notes pane with scrollable preview
 - Soft-delete trash and quick note switcher
+- Quoted file paths in TUI import/export, search snippets, tag browser
+- Tag browser can create tags and assign persistent custom colors
+- Bulk note actions, empty-trash command, preview search highlighting
 - Command palette (`:`), quick CLI capture, CLI search
 
 ## Installation
@@ -103,10 +106,17 @@ All fields are optional — missing fields fall back to the defaults above. The 
 | `:` | command palette |
 | `\` | toggle notes pane |
 | `Ctrl+P` | quick switcher |
+| `g` | browse and manage tags |
+| `x` | toggle note selection |
+| `*` | select all visible notes |
+| `u` | clear selection |
 | `p` | pin / unpin note |
 | `a` | archive / unarchive note |
 | `A` | toggle archived view |
 | `T` | toggle trash view |
+| `D` | move selected note(s) to trash |
+| `R` | restore selected note(s) |
+| `P` | permanently delete selected note(s) |
 | `r` | reload notes |
 | `?` | help overlay |
 | `q` | quit |
@@ -163,7 +173,35 @@ Navigation phase (after Enter):
 | `#tag` | filter by tag |
 | `/folder` | filter by folder |
 | `:archived` | show archived notes |
+| `:trash` | show trashed notes |
 | plain text | full-text search |
+
+### Tag browser (`g` or `:tags`)
+
+| Key | Action |
+|-----|--------|
+| `Enter` | filter notes by selected tag |
+| `n` | create a new tag |
+| `c` / `e` | choose a color for selected tag |
+| `Esc` | close browser or cancel tag editing |
+
+## Trash / Archive
+
+| Key / Command | Action |
+|---------------|--------|
+| `a` | archive, confirm archive, or unarchive the current note |
+| `A` | toggle archived view |
+| `T` | toggle trash view |
+| `D` | move selected note(s) to trash |
+| `R` | restore from trash, or unarchive in archived view |
+| `P` | permanently delete selected note(s) in trash |
+| `:archive` | arm archive confirmation for the current note |
+| `:archive!` | confirm and archive immediately |
+| `:unarchive` | restore an archived note |
+| `:trash` | show trash |
+| `:restore` | restore the selected trash note |
+| `:purge` | permanently delete the selected trash note |
+| `:empty-trash` | permanently delete all trashed notes |
 
 ### Vim keymap extras
 
@@ -182,18 +220,16 @@ Navigation phase (after Enter):
 | Command | Description |
 |---------|-------------|
 | `:new` | create a new note |
+| `:import <path...>` | import file(s) as notes; quote paths with spaces |
+| `:export <path>` | export the current note; quote paths with spaces |
 | `:edit` | open note in editor |
 | `:folder <name>` | move note to folder (blank = remove) |
 | `:pin` / `:unpin` | pin note to top of list |
-| `:archive` | hide note from main list |
-| `:unarchive` | restore an archived note |
 | `:search <query>` | run a search programmatically |
 | `:theme <name>` | `neo-noir` \| `paper` \| `matrix` |
 | `:keymap <name>` | `default` \| `vim` |
 | `:sort <mode>` | `manual` \| `updated` \| `title` |
-| `:trash` | show trashed notes |
-| `:restore` | restore selected trash note |
-| `:purge` | permanently delete selected trash note |
+| `:tags` | browse and manage tags |
 | `:reload` | refresh note list |
 | `:w` | save |
 | `:wq` / `:x` | save and quit |
@@ -203,4 +239,6 @@ Navigation phase (after Enter):
 
 Write `#tagname` on the first line of a note — tags are extracted automatically and searchable with `#tag` in the search bar.
 
-Tags are displayed as colored pills in the note header. The pill caps use Nerd Font powerline glyphs (`\uE0B6`/`\uE0B4`) — install a [Nerd Font](https://www.nerdfonts.com/) and set it as your terminal font for the best appearance.
+Open the tag browser with `g` or `:tags`, then use `n` to create a tag and `c` or `e` to choose its color. Created tags can exist before they are applied to a note, and chosen colors persist across restarts.
+
+Tags are displayed as colored pills in the note header, quick switcher, and tag browser. The pill caps use Nerd Font powerline glyphs (`\uE0B6`/`\uE0B4`) — install a [Nerd Font](https://www.nerdfonts.com/) and set it as your terminal font for the best appearance.

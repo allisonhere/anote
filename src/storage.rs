@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use std::collections::HashMap;
+
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -9,6 +11,7 @@ pub struct NoteSummary {
     pub updated_at: String,
     pub folder: String,
     pub tags: String,
+    pub snippet: String,
     pub pinned: bool,
     pub archived: bool,
     pub note_order: i64,
@@ -19,6 +22,13 @@ pub struct FolderEntry {
     pub id: i64,
     pub name: String,
     pub sort_order: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TagEntry {
+    pub tag: String,
+    pub count: i64,
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +123,13 @@ impl Store {
             );"
         )?;
 
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tag_meta (
+                name TEXT PRIMARY KEY,
+                color TEXT NOT NULL DEFAULT ''
+            );"
+        )?;
+
         // Seed folders table from existing notes
         self.conn.execute_batch(
             "INSERT OR IGNORE INTO folders (name, sort_order)
@@ -135,6 +152,55 @@ impl Store {
 
     pub fn list_notes_in_folder(&self, folder: &str, query: &str) -> Result<Vec<NoteSummary>> {
         self.list_notes_internal(query, Some(folder))
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<TagEntry>> {
+        let mut stmt = self.conn.prepare(
+            "WITH tag_counts AS (
+                SELECT tag, COUNT(*) AS count FROM (
+                    SELECT TRIM(value) AS tag
+                    FROM notes, json_each('[\"' || REPLACE(tags, ' ', '\",\"') || '\"]')
+                    WHERE tags != '' AND deleted_at IS NULL AND archived = 0
+                )
+                WHERE tag != ''
+                GROUP BY tag
+            ),
+            all_tags AS (
+                SELECT tag FROM tag_counts
+                UNION
+                SELECT name AS tag FROM tag_meta
+            )
+            SELECT all_tags.tag,
+                   COALESCE(tag_counts.count, 0) AS count,
+                   NULLIF(TRIM(tag_meta.color), '') AS color
+            FROM all_tags
+            LEFT JOIN tag_counts ON tag_counts.tag = all_tags.tag
+            LEFT JOIN tag_meta ON tag_meta.name = all_tags.tag
+            ORDER BY
+                CASE WHEN COALESCE(tag_counts.count, 0) = 0 THEN 1 ELSE 0 END,
+                COALESCE(tag_counts.count, 0) DESC,
+                all_tags.tag ASC"
+        )?;
+        let tags = stmt.query_map([], |row| {
+            Ok(TagEntry { tag: row.get(0)?, count: row.get(1)?, color: row.get(2)? })
+        })?.collect::<Result<Vec<_>, _>>()?;
+        Ok(tags)
+    }
+
+    pub fn list_tag_colors(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, color FROM tag_meta WHERE TRIM(color) != ''"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut colors = HashMap::new();
+        for row in rows {
+            let (tag, color) = row?;
+            colors.insert(tag, color);
+        }
+        Ok(colors)
     }
 
     pub fn list_folders(&self) -> Result<Vec<FolderEntry>> {
@@ -320,6 +386,31 @@ impl Store {
         self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])?;
         Ok(())
     }
+
+    pub fn purge_deleted_notes(&self) -> Result<usize> {
+        let deleted = self.conn.execute("DELETE FROM notes WHERE deleted_at IS NOT NULL", [])?;
+        Ok(deleted)
+    }
+
+    pub fn create_tag(&self, tag: &str) -> Result<String> {
+        let normalized = normalize_tag_name(tag)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tag_meta (name, color) VALUES (?1, '')",
+            params![normalized],
+        )?;
+        Ok(normalized)
+    }
+
+    pub fn set_tag_color(&self, tag: &str, color: Option<&str>) -> Result<String> {
+        let normalized = normalize_tag_name(tag)?;
+        let color = color.unwrap_or("").trim();
+        self.conn.execute(
+            "INSERT INTO tag_meta (name, color) VALUES (?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET color = excluded.color",
+            params![normalized, color],
+        )?;
+        Ok(normalized)
+    }
 }
 
 impl Store {
@@ -384,10 +475,16 @@ impl Store {
             "FROM notes n"
         };
         let sql = format!(
-            "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, n.pinned, n.archived, n.note_order \
+            "SELECT n.id, n.title, n.updated_at, n.folder, n.tags, \
+             {} AS snippet, n.pinned, n.archived, n.note_order \
              {from_clause} \
              WHERE {} \
              ORDER BY {order_by} LIMIT {limit}",
+            if has_fts {
+                "snippet(notes_fts, 1, '[', ']', ' … ', 12)"
+            } else {
+                "''"
+            },
             where_clauses.join(" AND ")
         );
 
@@ -399,9 +496,10 @@ impl Store {
                 updated_at: row.get(2)?,
                 folder: row.get(3)?,
                 tags: row.get(4)?,
-                pinned: row.get::<_, i64>(5)? != 0,
-                archived: row.get::<_, i64>(6)? != 0,
-                note_order: row.get(7)?,
+                snippet: row.get(5)?,
+                pinned: row.get::<_, i64>(6)? != 0,
+                archived: row.get::<_, i64>(7)? != 0,
+                note_order: row.get(8)?,
             })
         })?;
 
@@ -447,6 +545,17 @@ fn derive_title(body: &str) -> String {
 
 fn is_tag_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+fn normalize_tag_name(tag: &str) -> Result<String> {
+    let trimmed = tag.trim().trim_start_matches('#').to_ascii_lowercase();
+    if trimmed.len() < 2 {
+        bail!("tag must be at least 2 characters");
+    }
+    if !trimmed.chars().all(is_tag_char) {
+        bail!("tag may only use letters, numbers, '_' and '-'");
+    }
+    Ok(trimmed)
 }
 
 fn extract_tags(body: &str) -> String {
@@ -497,12 +606,17 @@ fn parse_query(query: &str) -> (Vec<String>, Option<String>, bool, bool, String)
                 folder = Some(rest.to_ascii_lowercase());
             }
         } else {
-            fts_tokens.push(token.to_string());
+            fts_tokens.push(fts_literal_token(token));
         }
     }
 
     let fts = fts_tokens.join(" ");
     (tags, folder, show_archived, show_trash, fts)
+}
+
+fn fts_literal_token(token: &str) -> String {
+    let escaped = token.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
 }
 
 #[cfg(test)]
@@ -544,5 +658,39 @@ mod tests {
         let notes = store.list_notes_in_folder("projects", "rust #work").unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0].id, alpha);
+    }
+
+    #[test]
+    fn fts_search_treats_colons_as_literal_text() {
+        let store = Store::open_for_test().unwrap();
+        let id = store
+            .create_note("Untitled", "Use context-mode:ctx-stats for plugin checks")
+            .unwrap();
+
+        let notes = store.list_notes("context-mode:ctx-stats").unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].id, id);
+    }
+
+    #[test]
+    fn tag_meta_includes_unused_tags_and_colors() {
+        let store = Store::open_for_test().unwrap();
+        store.create_note("Untitled", "alpha #rust body").unwrap();
+        store.create_tag("idea").unwrap();
+        store.set_tag_color("idea", Some("purple")).unwrap();
+        store.set_tag_color("rust", Some("teal")).unwrap();
+
+        let tags = store.list_tags().unwrap();
+        assert_eq!(tags[0].tag, "rust");
+        assert_eq!(tags[0].count, 1);
+        assert_eq!(tags[0].color.as_deref(), Some("teal"));
+
+        let idea = tags.iter().find(|entry| entry.tag == "idea").unwrap();
+        assert_eq!(idea.count, 0);
+        assert_eq!(idea.color.as_deref(), Some("purple"));
+
+        let colors = store.list_tag_colors().unwrap();
+        assert_eq!(colors.get("rust").map(String::as_str), Some("teal"));
+        assert_eq!(colors.get("idea").map(String::as_str), Some("purple"));
     }
 }

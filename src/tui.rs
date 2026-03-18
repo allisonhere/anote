@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -39,7 +40,7 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
 use crate::config::AppConfig;
-use crate::storage::{NoteSummary, Store};
+use crate::storage::{NoteSummary, Store, TagEntry};
 
 // arboard is optional at runtime (no display server): treat errors as no-op.
 use arboard::Clipboard;
@@ -52,7 +53,15 @@ enum Mode {
     Command,
     Find,
     Switcher,
+    Tags,
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagBrowserMode {
+    Browse,
+    Create,
+    Color,
 }
 
 #[derive(Debug, Clone)]
@@ -149,37 +158,8 @@ impl ThemeName {
         }
     }
 
-    // (bg, fg) pairs for tag pills — one per theme, hashed by tag name
-    fn tag_pill_colors(self) -> &'static [(Color, Color)] {
-        const BG: Color = Color::Rgb(12, 14, 18);   // NeoNoir bg
-        const PG: Color = Color::Rgb(246, 242, 230); // Paper bg
-        const MG: Color = Color::Rgb(4, 16, 10);    // Matrix bg
-        match self {
-            Self::NeoNoir => &[
-                (Color::Rgb(56, 189, 248),  BG), // sky
-                (Color::Rgb(167, 139, 250), BG), // violet
-                (Color::Rgb(74, 222, 128),  BG), // green
-                (Color::Rgb(251, 146, 60),  BG), // orange
-                (Color::Rgb(244, 114, 182), BG), // pink
-                (Color::Rgb(250, 204, 21),  BG), // yellow
-            ],
-            Self::Paper => &[
-                (Color::Rgb(185, 28, 28),   PG), // red
-                (Color::Rgb(29, 78, 216),   PG), // blue
-                (Color::Rgb(21, 128, 61),   PG), // green
-                (Color::Rgb(194, 65, 12),   PG), // orange
-                (Color::Rgb(126, 34, 206),  PG), // purple
-                (Color::Rgb(15, 118, 110),  PG), // teal
-            ],
-            Self::Matrix => &[
-                (Color::Rgb(52, 211, 153),  MG), // teal
-                (Color::Rgb(34, 211, 238),  MG), // cyan
-                (Color::Rgb(163, 230, 53),  MG), // lime
-                (Color::Rgb(96, 165, 250),  MG), // blue
-                (Color::Rgb(244, 114, 182), MG), // pink
-                (Color::Rgb(167, 139, 250), MG), // purple
-            ],
-        }
+    fn tag_color_choices(self) -> &'static [TagColorChoice] {
+        &TAG_COLOR_CHOICES
     }
 }
 
@@ -287,6 +267,84 @@ struct Palette {
     danger: Color,
     ok: Color,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct TagColorChoice {
+    key: &'static str,
+    label: &'static str,
+    neo: (Color, Color),
+    paper: (Color, Color),
+    matrix: (Color, Color),
+}
+
+impl TagColorChoice {
+    fn colors(self, theme: ThemeName) -> (Color, Color) {
+        match theme {
+            ThemeName::NeoNoir => self.neo,
+            ThemeName::Paper => self.paper,
+            ThemeName::Matrix => self.matrix,
+        }
+    }
+}
+
+const TAG_COLOR_CHOICES: [TagColorChoice; 8] = [
+    TagColorChoice {
+        key: "sky",
+        label: "Sky",
+        neo: (Color::Rgb(56, 189, 248), Color::Rgb(12, 14, 18)),
+        paper: (Color::Rgb(29, 78, 216), Color::Rgb(246, 242, 230)),
+        matrix: (Color::Rgb(34, 211, 238), Color::Rgb(4, 16, 10)),
+    },
+    TagColorChoice {
+        key: "violet",
+        label: "Violet",
+        neo: (Color::Rgb(167, 139, 250), Color::Rgb(12, 14, 18)),
+        paper: (Color::Rgb(126, 34, 206), Color::Rgb(246, 242, 230)),
+        matrix: (Color::Rgb(167, 139, 250), Color::Rgb(4, 16, 10)),
+    },
+    TagColorChoice {
+        key: "green",
+        label: "Green",
+        neo: (Color::Rgb(74, 222, 128), Color::Rgb(12, 14, 18)),
+        paper: (Color::Rgb(21, 128, 61), Color::Rgb(246, 242, 230)),
+        matrix: (Color::Rgb(163, 230, 53), Color::Rgb(4, 16, 10)),
+    },
+    TagColorChoice {
+        key: "orange",
+        label: "Orange",
+        neo: (Color::Rgb(251, 146, 60), Color::Rgb(12, 14, 18)),
+        paper: (Color::Rgb(194, 65, 12), Color::Rgb(246, 242, 230)),
+        matrix: (Color::Rgb(96, 165, 250), Color::Rgb(4, 16, 10)),
+    },
+    TagColorChoice {
+        key: "pink",
+        label: "Pink",
+        neo: (Color::Rgb(244, 114, 182), Color::Rgb(12, 14, 18)),
+        paper: (Color::Rgb(190, 24, 93), Color::Rgb(246, 242, 230)),
+        matrix: (Color::Rgb(244, 114, 182), Color::Rgb(4, 16, 10)),
+    },
+    TagColorChoice {
+        key: "yellow",
+        label: "Yellow",
+        neo: (Color::Rgb(250, 204, 21), Color::Rgb(12, 14, 18)),
+        paper: (Color::Rgb(161, 98, 7), Color::Rgb(246, 242, 230)),
+        matrix: (Color::Rgb(250, 204, 21), Color::Rgb(4, 16, 10)),
+    },
+    TagColorChoice {
+        key: "teal",
+        label: "Teal",
+        neo: (Color::Rgb(45, 212, 191), Color::Rgb(12, 14, 18)),
+        paper: (Color::Rgb(15, 118, 110), Color::Rgb(246, 242, 230)),
+        matrix: (Color::Rgb(52, 211, 153), Color::Rgb(4, 16, 10)),
+    },
+    TagColorChoice {
+        key: "red",
+        label: "Red",
+        neo: (Color::Rgb(248, 113, 113), Color::Rgb(12, 14, 18)),
+        paper: (Color::Rgb(185, 28, 28), Color::Rgb(246, 242, 230)),
+        matrix: (Color::Rgb(248, 113, 113), Color::Rgb(4, 16, 10)),
+    },
+];
 
 #[derive(Debug, Clone, PartialEq)]
 struct EditorBuffer {
@@ -545,6 +603,7 @@ pub struct App {
     tree: Vec<TreeItem>,
     tree_cursor: usize,
     tree_expanded: std::collections::HashSet<String>,
+    selected_note_ids: HashSet<i64>,
     tree_inline_input: String,
     tree_inline_mode: TreeInlineMode,
     active_note_id: Option<i64>,
@@ -557,6 +616,12 @@ pub struct App {
     switcher_input: String,
     switcher_cursor: usize,
     switcher_results: Vec<NoteSummary>,
+    tag_browser_cursor: usize,
+    tag_browser_entries: Vec<TagEntry>,
+    tag_browser_mode: TagBrowserMode,
+    tag_browser_input: String,
+    tag_color_cursor: usize,
+    tag_color_overrides: HashMap<String, String>,
     mode: Mode,
     status: String,
     dirty: bool,
@@ -570,6 +635,7 @@ pub struct App {
     lints_active: bool,
     last_edit: Option<Instant>,
     delete_pending: bool,
+    archive_pending: bool,
     editor_col_width: usize,
     editor_row_height: usize,
     selection_anchor: Option<usize>,
@@ -601,6 +667,7 @@ impl App {
             tree: Vec::new(),
             tree_cursor: 0,
             tree_expanded: std::collections::HashSet::new(),
+            selected_note_ids: HashSet::new(),
             tree_inline_input: String::new(),
             tree_inline_mode: TreeInlineMode::None,
             active_note_id: None,
@@ -613,6 +680,12 @@ impl App {
             switcher_input: String::new(),
             switcher_cursor: 0,
             switcher_results: Vec::new(),
+            tag_browser_cursor: 0,
+            tag_browser_entries: Vec::new(),
+            tag_browser_mode: TagBrowserMode::Browse,
+            tag_browser_input: String::new(),
+            tag_color_cursor: 0,
+            tag_color_overrides: HashMap::new(),
             mode: Mode::Normal,
             status: "Ready".to_string(),
             dirty: false,
@@ -630,6 +703,7 @@ impl App {
             lints_active: false,
             last_edit: None,
             delete_pending: false,
+            archive_pending: false,
             editor_col_width: 80,
             editor_row_height: 40,
             selection_anchor: None,
@@ -799,6 +873,7 @@ impl App {
             Mode::Command => self.handle_command_key(key),
             Mode::Find => self.handle_find_key(key),
             Mode::Switcher => self.handle_switcher_key(key),
+            Mode::Tags => self.handle_tags_key(key),
             Mode::Help => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
@@ -1068,10 +1143,75 @@ impl App {
             self.switcher_input.trim().to_string()
         };
         self.switcher_results = self.store.list_notes_for_switcher(&query)?;
+        self.rank_switcher_results();
         if self.switcher_cursor >= self.switcher_results.len() {
             self.switcher_cursor = self.switcher_results.len().saturating_sub(1);
         }
         Ok(())
+    }
+
+    fn rank_switcher_results(&mut self) {
+        let query = self.switcher_input.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            self.switcher_results.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            return;
+        }
+
+        self.switcher_results.sort_by(|a, b| {
+            let rank = |note: &NoteSummary| -> u8 {
+                let title = note.title.to_ascii_lowercase();
+                let snippet = note.snippet.to_ascii_lowercase();
+                if title == query {
+                    0
+                } else if title.starts_with(&query) {
+                    1
+                } else if title.contains(&query) {
+                    2
+                } else if snippet.contains(&query) {
+                    3
+                } else {
+                    4
+                }
+            };
+            rank(a).cmp(&rank(b)).then_with(|| b.updated_at.cmp(&a.updated_at))
+        });
+    }
+
+    fn open_tag_browser(&mut self) -> Result<()> {
+        self.reload_tag_metadata()?;
+        self.tag_browser_entries = self.store.list_tags()?;
+        self.tag_browser_cursor = 0;
+        self.tag_browser_mode = TagBrowserMode::Browse;
+        self.tag_browser_input.clear();
+        self.tag_color_cursor = 0;
+        self.mode = Mode::Tags;
+        self.status = "Tags: Enter filter, n create, c color".to_string();
+        Ok(())
+    }
+
+    fn reload_tag_metadata(&mut self) -> Result<()> {
+        self.tag_color_overrides = self.store.list_tag_colors()?;
+        Ok(())
+    }
+
+    fn refresh_tag_browser_entries(&mut self) -> Result<()> {
+        self.tag_browser_entries = self.store.list_tags()?;
+        if self.tag_browser_cursor >= self.tag_browser_entries.len() {
+            self.tag_browser_cursor = self.tag_browser_entries.len().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    fn selected_tag_entry(&self) -> Option<&TagEntry> {
+        self.tag_browser_entries.get(self.tag_browser_cursor)
+    }
+
+    fn selected_tag_name(&self) -> Option<&str> {
+        self.selected_tag_entry().map(|entry| entry.tag.as_str())
+    }
+
+    fn tag_color_key_for<'a>(&'a self, tag: &str) -> Option<&'a str> {
+        self.tag_color_overrides.get(tag).map(String::as_str)
     }
 
     fn accept_switcher_selection(&mut self) -> Result<()> {
@@ -1096,6 +1236,126 @@ impl App {
         self.mode = Mode::Normal;
         self.status = format!("Jumped to {}", selected.title);
         Ok(())
+    }
+
+    fn selected_note_ids_in_view(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .tree
+            .iter()
+            .filter_map(|item| item.note())
+            .filter(|note| self.selected_note_ids.contains(&note.id))
+            .map(|note| note.id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn current_note_id(&self) -> Option<i64> {
+        self.tree.get(self.tree_cursor).and_then(|item| item.note()).map(|note| note.id)
+    }
+
+    fn in_archived_view(&self) -> bool {
+        self.query.split_whitespace().any(|token| token.eq_ignore_ascii_case(":archived"))
+    }
+
+    fn in_trash_view(&self) -> bool {
+        self.query.split_whitespace().any(|token| token.eq_ignore_ascii_case(":trash"))
+    }
+
+    fn toggle_current_selection(&mut self) {
+        if let Some(id) = self.current_note_id() {
+            if !self.selected_note_ids.insert(id) {
+                self.selected_note_ids.remove(&id);
+            }
+            let count = self.selected_note_ids_in_view().len();
+            self.status = if count == 0 {
+                "Selection cleared".to_string()
+            } else {
+                format!("Selected {} note{}", count, if count == 1 { "" } else { "s" })
+            };
+        }
+    }
+
+    fn select_all_visible_notes(&mut self) {
+        for id in self.tree.iter().filter_map(|item| item.note()).map(|note| note.id) {
+            self.selected_note_ids.insert(id);
+        }
+        let count = self.selected_note_ids_in_view().len();
+        self.status = format!("Selected {} visible note{}", count, if count == 1 { "" } else { "s" });
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected_note_ids.clear();
+        self.status = "Selection cleared".to_string();
+    }
+
+    fn target_note_ids_for_action(&self) -> Vec<i64> {
+        let selected = self.selected_note_ids_in_view();
+        if !selected.is_empty() {
+            selected
+        } else {
+            self.current_note_id().into_iter().collect()
+        }
+    }
+
+    fn apply_bulk_action(&mut self, action: &str) -> Result<()> {
+        let ids = self.target_note_ids_for_action();
+        if ids.is_empty() {
+            self.status = "No notes selected".to_string();
+            return Ok(());
+        }
+
+        match action {
+            "archive" => {
+                for id in &ids {
+                    self.store.set_archived(*id, true)?;
+                }
+                self.status = format!("Archived {} note{}", ids.len(), if ids.len() == 1 { "" } else { "s" });
+            }
+            "unarchive" => {
+                for id in &ids {
+                    self.store.set_archived(*id, false)?;
+                }
+                self.status = format!("Unarchived {} note{}", ids.len(), if ids.len() == 1 { "" } else { "s" });
+            }
+            "trash" => {
+                for id in &ids {
+                    self.store.delete_note(*id)?;
+                }
+                self.status = format!("Moved {} note{} to trash", ids.len(), if ids.len() == 1 { "" } else { "s" });
+            }
+            "restore" => {
+                for id in &ids {
+                    self.store.restore_note(*id)?;
+                }
+                self.status = format!("Restored {} note{}", ids.len(), if ids.len() == 1 { "" } else { "s" });
+            }
+            "purge" => {
+                for id in &ids {
+                    self.store.purge_note(*id)?;
+                }
+                self.status = format!("Permanently deleted {} note{}", ids.len(), if ids.len() == 1 { "" } else { "s" });
+            }
+            _ => {}
+        }
+
+        for id in &ids {
+            self.selected_note_ids.remove(id);
+        }
+        self.refresh_notes()?;
+        self.sync_active_note_from_cursor()?;
+        Ok(())
+    }
+
+    fn arm_archive_confirmation(&mut self) {
+        let count = self.target_note_ids_for_action().len();
+        self.archive_pending = true;
+        self.status = format!(
+            "Archive {} note{}? press 'a' again to confirm, any other key cancels",
+            count,
+            if count == 1 { "" } else { "s" }
+        );
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -1123,6 +1383,16 @@ impl App {
             return Ok(false);
         }
 
+        if key.code == KeyCode::Char('g') {
+            self.open_tag_browser()?;
+            return Ok(false);
+        }
+
+        if key.code == KeyCode::Char('u') {
+            self.clear_selection();
+            return Ok(false);
+        }
+
         if is_ctrl_char(&key, 'p') {
             self.quit_pending = false;
             self.open_switcher()?;
@@ -1132,6 +1402,11 @@ impl App {
         if self.quit_pending && key.code != KeyCode::Char('q') {
             self.quit_pending = false;
             self.status = "Quit canceled".to_string();
+        }
+
+        if self.archive_pending && key.code != KeyCode::Char('a') {
+            self.archive_pending = false;
+            self.status = "Archive canceled".to_string();
         }
 
         if key.code == KeyCode::Char('q') {
@@ -1243,6 +1518,12 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Char('x') => {
+                self.toggle_current_selection();
+            }
+            KeyCode::Char('*') => {
+                self.select_all_visible_notes();
+            }
             KeyCode::Char(' ') => {
                 if let Some(TreeItem::Folder { name, expanded, .. }) = self.tree.get(self.tree_cursor).cloned() {
                     self.toggle_folder(&name, expanded)?;
@@ -1273,7 +1554,13 @@ impl App {
                 self.status = "Created note".to_string();
             }
             KeyCode::Char('p') => {
-                if let Some(id) = self.active_note_id {
+                if !self.selected_note_ids_in_view().is_empty() {
+                    for id in self.selected_note_ids_in_view() {
+                        self.store.set_pinned(id, true)?;
+                    }
+                    self.refresh_notes()?;
+                    self.status = "Pinned selected notes".to_string();
+                } else if let Some(id) = self.active_note_id {
                     let pinned = self.active_summary().map(|note| note.pinned).unwrap_or(false);
                     self.store.set_pinned(id, !pinned)?;
                     self.refresh_notes()?;
@@ -1283,15 +1570,30 @@ impl App {
                 }
             }
             KeyCode::Char('a') => {
-                if let Some(id) = self.active_note_id {
+                if !self.selected_note_ids_in_view().is_empty() {
+                    if self.archive_pending {
+                        self.archive_pending = false;
+                        self.apply_bulk_action("archive")?;
+                    } else {
+                        self.arm_archive_confirmation();
+                    }
+                } else if let Some(id) = self.active_note_id {
                     let archived = self.active_summary().map(|note| note.archived).unwrap_or(false);
-                    self.store.set_archived(id, !archived)?;
-                    self.refresh_notes()?;
                     if archived {
+                        self.store.set_archived(id, false)?;
+                        self.refresh_notes()?;
                         self.select_by_id(id);
                         self.status = "Note unarchived".to_string();
                     } else {
-                        self.status = "Note archived".to_string();
+                        if self.archive_pending {
+                            self.archive_pending = false;
+                            self.store.set_archived(id, true)?;
+                            self.refresh_notes()?;
+                            self.status = "Note archived".to_string();
+                        } else {
+                            self.arm_archive_confirmation();
+                            return Ok(false);
+                        }
                     }
                     self.sync_active_note_from_cursor()?;
                 }
@@ -1323,6 +1625,25 @@ impl App {
                 }
                 self.refresh_notes()?;
                 self.restore_search_cursor(0)?;
+            }
+            KeyCode::Char('D') => {
+                self.apply_bulk_action("trash")?;
+            }
+            KeyCode::Char('R') => {
+                if self.in_trash_view() {
+                    self.apply_bulk_action("restore")?;
+                } else if self.in_archived_view() {
+                    self.apply_bulk_action("unarchive")?;
+                } else {
+                    self.status = "Restore works in trash; use archived view to unarchive".to_string();
+                }
+            }
+            KeyCode::Char('P') => {
+                if self.in_trash_view() {
+                    self.apply_bulk_action("purge")?;
+                } else {
+                    self.status = "Purge works in trash view only".to_string();
+                }
             }
             KeyCode::Char('e') | KeyCode::Enter => {
                 match self.tree.get(self.tree_cursor).cloned() {
@@ -1412,6 +1733,7 @@ impl App {
             }
             _ => {
                 self.delete_pending = false;
+                self.archive_pending = false;
                 self.quit_pending = false;
             }
         }
@@ -1824,6 +2146,126 @@ impl App {
         Ok(false)
     }
 
+    fn handle_tags_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match self.tag_browser_mode {
+            TagBrowserMode::Browse => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Normal;
+                    self.status = "Tag browser closed".to_string();
+                }
+                KeyCode::Up => {
+                    self.tag_browser_cursor = self.tag_browser_cursor.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    if self.tag_browser_cursor + 1 < self.tag_browser_entries.len() {
+                        self.tag_browser_cursor += 1;
+                    }
+                }
+                KeyCode::Char('n') => {
+                    self.tag_browser_mode = TagBrowserMode::Create;
+                    self.tag_browser_input.clear();
+                    self.status = "New tag: type a name, Enter to create".to_string();
+                }
+                KeyCode::Char('c') | KeyCode::Char('e') => {
+                    if let Some(tag) = self.selected_tag_name().map(str::to_string) {
+                        self.tag_browser_mode = TagBrowserMode::Color;
+                        let current = self.tag_color_overrides.get(&tag).cloned();
+                        self.tag_color_cursor = tag_color_choice_index(current.as_deref());
+                        self.status = format!("Color for #{}: Enter save, Esc cancel", tag);
+                    } else {
+                        self.status = "No tag selected".to_string();
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(tag) = self.selected_tag_name() {
+                        let tag = tag.to_string();
+                        self.query = format!("#{}", tag);
+                        self.refresh_notes()?;
+                        self.restore_search_cursor(0)?;
+                        self.mode = Mode::Normal;
+                        self.status = format!("Showing tag #{}", tag);
+                    }
+                }
+                _ => {}
+            },
+            TagBrowserMode::Create => match key.code {
+                KeyCode::Esc => {
+                    self.tag_browser_mode = TagBrowserMode::Browse;
+                    self.tag_browser_input.clear();
+                    self.status = "Tag creation canceled".to_string();
+                }
+                KeyCode::Backspace => {
+                    self.tag_browser_input.pop();
+                }
+                KeyCode::Enter => {
+                    match self.store.create_tag(&self.tag_browser_input) {
+                        Ok(tag) => {
+                            self.reload_tag_metadata()?;
+                            self.refresh_tag_browser_entries()?;
+                            if let Some(pos) = self.tag_browser_entries.iter().position(|entry| entry.tag == tag) {
+                                self.tag_browser_cursor = pos;
+                            }
+                            self.tag_browser_mode = TagBrowserMode::Color;
+                            self.tag_color_cursor = 0;
+                            self.status = format!("Created #{}. Choose a color", tag);
+                        }
+                        Err(err) => {
+                            self.status = format!("Tag error: {}", err);
+                        }
+                    }
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.tag_browser_input.push(c);
+                }
+                _ => {}
+            },
+            TagBrowserMode::Color => match key.code {
+                KeyCode::Esc => {
+                    self.tag_browser_mode = TagBrowserMode::Browse;
+                    self.status = "Tag color canceled".to_string();
+                }
+                KeyCode::Left | KeyCode::Up => {
+                    self.tag_color_cursor = self.tag_color_cursor.saturating_sub(1);
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    let max = self.theme.tag_color_choices().len();
+                    if self.tag_color_cursor < max {
+                        self.tag_color_cursor += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(tag) = self.selected_tag_name() {
+                        let tag = tag.to_string();
+                        let color = if self.tag_color_cursor == 0 {
+                            None
+                        } else {
+                            Some(self.theme.tag_color_choices()[self.tag_color_cursor - 1].key)
+                        };
+                        match self.store.set_tag_color(&tag, color) {
+                            Ok(_) => {
+                                self.reload_tag_metadata()?;
+                                self.refresh_tag_browser_entries()?;
+                                self.tag_browser_mode = TagBrowserMode::Browse;
+                                self.status = match color {
+                                    Some(color) => format!("Tag #{} color -> {}", tag, color),
+                                    None => format!("Tag #{} color -> auto", tag),
+                                };
+                            }
+                            Err(err) => {
+                                self.status = format!("Tag color error: {}", err);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+        Ok(false)
+    }
+
     fn handle_find_key(&mut self, key: KeyEvent) -> Result<bool> {
         if key.code == KeyCode::Esc {
             self.find_matches.clear();
@@ -2019,7 +2461,8 @@ impl App {
             return Ok(false);
         }
 
-        let mut parts = command.split_whitespace();
+        let parts = parse_command_parts(command);
+        let mut parts = parts.iter().map(String::as_str);
         let name = parts.next().unwrap_or_default().to_ascii_lowercase();
 
         match name.as_str() {
@@ -2039,6 +2482,61 @@ impl App {
                 self.sync_active_note_from_cursor()?;
                 self.enter_edit_mode();
                 self.status = "Created note".to_string();
+            }
+            "import" => {
+                let files: Vec<PathBuf> = parts.map(PathBuf::from).collect();
+                if files.is_empty() {
+                    self.status = "Usage: :import <path...>".to_string();
+                } else {
+                    let mut imported = 0usize;
+                    let mut last_id = None;
+                    for path in &files {
+                        match std::fs::read_to_string(path) {
+                            Ok(body) => {
+                                let note_title = path
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().replace(['-', '_'], " "))
+                                    .unwrap_or_else(|| "Untitled".to_string());
+                                let id = self.store.create_note_with_title_lock(&note_title, &body, true)?;
+                                imported += 1;
+                                last_id = Some(id);
+                            }
+                            Err(err) => {
+                                self.status = format!("Import failed for {}: {}", path.display(), err);
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    self.refresh_notes()?;
+                    if let Some(id) = last_id {
+                        self.select_by_id(id);
+                        self.sync_active_note_from_cursor()?;
+                    }
+                    self.status = format!("Imported {} file{}", imported, if imported == 1 { "" } else { "s" });
+                }
+            }
+            "export" => {
+                let Some(id) = self.active_note_id else {
+                    self.status = "No active note".to_string();
+                    return Ok(false);
+                };
+                let Some(path) = parts.next() else {
+                    self.status = "Usage: :export <path>".to_string();
+                    return Ok(false);
+                };
+                let Some(note) = self.store.get_note(id)? else {
+                    self.status = format!("Note {} not found", id);
+                    return Ok(false);
+                };
+                let output = PathBuf::from(path);
+                match std::fs::write(&output, note.body) {
+                    Ok(_) => {
+                        self.status = format!("Exported note {} to {}", id, output.display());
+                    }
+                    Err(err) => {
+                        self.status = format!("Export failed for {}: {}", output.display(), err);
+                    }
+                }
             }
             "edit" => {
                 if self.active_note_id.is_some() {
@@ -2091,6 +2589,9 @@ impl App {
                     self.status = "Usage: :sort manual|updated|title".to_string();
                 }
             }
+            "tags" => {
+                self.open_tag_browser()?;
+            }
             "trash" => {
                 self.query = ":trash".to_string();
                 self.refresh_notes()?;
@@ -2118,6 +2619,12 @@ impl App {
                 } else {
                     self.status = "No active note".to_string();
                 }
+            }
+            "empty-trash" => {
+                let count = self.store.purge_deleted_notes()?;
+                self.refresh_notes()?;
+                self.sync_active_note_from_cursor()?;
+                self.status = format!("Emptied trash: {} note{}", count, if count == 1 { "" } else { "s" });
             }
             "folder" => {
                 let name = parts.collect::<Vec<_>>().join(" ");
@@ -2159,15 +2666,24 @@ impl App {
                     self.status = "No active note".to_string();
                 }
             }
-            "archive" => {
+            "archive" | "archive!" => {
                 if let Some(id) = self.active_note_id {
-                    self.store.set_archived(id, true)?;
-                    self.refresh_notes()?;
-                    if self.tree_cursor >= self.tree.len() && !self.tree.is_empty() {
-                        self.tree_cursor = self.tree.len() - 1;
+                    let archived = self.active_summary().map(|note| note.archived).unwrap_or(false);
+                    if archived {
+                        self.status = "Note is already archived".to_string();
+                    } else if name == "archive!" {
+                        self.archive_pending = false;
+                        self.store.set_archived(id, true)?;
+                        self.refresh_notes()?;
+                        if self.tree_cursor >= self.tree.len() && !self.tree.is_empty() {
+                            self.tree_cursor = self.tree.len() - 1;
+                        }
+                        self.sync_active_note_from_cursor()?;
+                        self.status = "Note archived".to_string();
+                    } else {
+                        self.archive_pending = true;
+                        self.status = "Confirm archive with :archive! or press 'a' again".to_string();
                     }
-                    self.sync_active_note_from_cursor()?;
-                    self.status = "Note archived".to_string();
                 } else {
                     self.status = "No active note".to_string();
                 }
@@ -2345,6 +2861,7 @@ impl App {
     }
 
     fn refresh_notes(&mut self) -> Result<()> {
+        self.reload_tag_metadata()?;
         self.rebuild_tree()?;
         Ok(())
     }
@@ -3246,14 +3763,16 @@ impl App {
         };
 
         let note_count = self.tree.iter().filter(|i| i.is_note()).count();
+        let selected_count = self.selected_note_ids_in_view().len();
         let top_text = Text::from(Line::from(vec![
             TSpan::styled(
                 format!(
-                    " anote  theme:{}  keymap:{}  sort:{}  notes:{}  {}",
+                    " anote  theme:{}  keymap:{}  sort:{}  notes:{}  sel:{}  {}",
                     self.theme.label(),
                     self.keymap.label(),
                     self.sort_mode.label(),
                     note_count,
+                    selected_count,
                     query_tag
                 ),
                 Style::default()
@@ -3340,6 +3859,7 @@ impl App {
                         }
                     }
                     TreeItem::Note(note) => {
+                        let is_marked = self.selected_note_ids.contains(&note.id);
                         let in_folder = !note.folder.is_empty();
                         let is_last_in_group = {
                             let next = self.tree.get(idx + 1);
@@ -3355,15 +3875,16 @@ impl App {
                             "  "
                         };
                         let note_icon = if note.pinned { "\u{f0403} " } else { "\u{f0219} " };
+                        let selection_mark = if is_marked { "[x] " } else { "[ ] " };
 
                         // If renaming this note, show inline input
                         if matches!(&self.tree_inline_mode, TreeInlineMode::RenameNote(id) if *id == note.id) {
                             let input_line = format!("{}{} {}█", tree_prefix, note_icon, self.tree_inline_input);
                             ListItem::new(TSpan::styled(input_line, Style::default().fg(palette.accent)))
                         } else {
-                            let pill_colors = self.theme.tag_pill_colors();
                             let mut spans = vec![
                                 TSpan::styled(tree_prefix.to_string(), Style::default().fg(palette.muted)),
+                                TSpan::styled(selection_mark.to_string(), if is_selected { base_style } else { Style::default().fg(palette.muted) }),
                                 TSpan::styled(note_icon.to_string(), if is_selected { base_style } else { Style::default().fg(palette.muted) }),
                                 TSpan::styled(note.title.clone(), base_style),
                             ];
@@ -3371,10 +3892,26 @@ impl App {
                                 spans.push(TSpan::raw(" "));
                                 spans.push(TSpan::styled(
                                     "●",
-                                    tag_dot_style(tag, pill_colors),
+                                    tag_dot_style(self.theme, tag, self.tag_color_key_for(tag)),
                                 ));
                             }
-                            ListItem::new(Line::from(spans))
+                            if !note.snippet.is_empty() && !self.query.is_empty() {
+                                ListItem::new(Text::from(vec![
+                                    Line::from(spans),
+                                    Line::from(vec![
+                                        TSpan::styled(
+                                            format!("    {}", note.snippet.replace(['[', ']'], "")),
+                                            if is_selected {
+                                                Style::default().bg(palette.accent).fg(palette.bg)
+                                            } else {
+                                                Style::default().fg(palette.muted)
+                                            },
+                                        ),
+                                    ]),
+                                ]))
+                            } else {
+                                ListItem::new(Line::from(spans))
+                            }
                         }
                     }
                 };
@@ -3424,7 +3961,6 @@ impl App {
             .fg(palette.text)
             .add_modifier(Modifier::BOLD);
         let header_lines: Vec<Line<'static>> = if let Some(summary) = self.active_summary() {
-            let pill_colors = self.theme.tag_pill_colors();
             let mut lines = vec![Line::from(vec![TSpan::styled(summary.title.clone(), title_style)])];
 
             let mut meta_spans: Vec<TSpan<'static>> = vec![
@@ -3445,7 +3981,7 @@ impl App {
                     if idx > 0 {
                         tag_spans.push(TSpan::raw(" "));
                     }
-                    for span in tag_pill_spans(tag, pill_colors, palette.panel) {
+                    for span in tag_pill_spans(self.theme, tag, self.tag_color_key_for(tag), palette.panel) {
                         tag_spans.push(span);
                     }
                 }
@@ -3473,6 +4009,7 @@ impl App {
             Mode::Command => " Preview ",
             Mode::Find => " Edit (find) ",
             Mode::Switcher => " Preview ",
+            Mode::Tags => " Preview ",
             Mode::Help => " Preview ",
         };
 
@@ -3539,6 +4076,7 @@ impl App {
                 editor_layout[1].width as usize,
                 &self.syntax_set,
                 &self.theme_set,
+                &preview_highlight_terms(&self.query),
             );
             let preview = Paragraph::new(md_text)
                 .style(Style::default().fg(palette.text).bg(palette.panel))
@@ -3573,6 +4111,7 @@ impl App {
             Mode::Command => "COMMAND",
             Mode::Find => "FIND",
             Mode::Switcher => "SWITCH",
+            Mode::Tags => "TAGS",
             Mode::Help => "HELP",
         };
         let dirty_text = if self.dirty { "*" } else { "" };
@@ -3597,6 +4136,23 @@ impl App {
                 &["Enter open", "Esc cancel", "↑↓ move"],
                 footer_width,
             ),
+            Mode::Tags => {
+                let (left, hints): (String, Vec<&str>) = match self.tag_browser_mode {
+                    TagBrowserMode::Browse => (
+                        "[TAGS] browse tags".to_string(),
+                        vec!["Enter filter", "n new", "c color", "Esc close"],
+                    ),
+                    TagBrowserMode::Create => (
+                        format!("[TAGS] new #{}", self.tag_browser_input),
+                        vec!["Enter create", "Bksp edit", "Esc cancel"],
+                    ),
+                    TagBrowserMode::Color => (
+                        "[TAGS] choose color".to_string(),
+                        vec!["←→ pick", "Enter save", "Esc cancel"],
+                    ),
+                };
+                fit_footer_segments(&left, &hints, footer_width)
+            }
             Mode::Help => fit_footer_segments(
                 &format!("[{}] {}", mode_text, self.status),
                 &["j/k scroll", "PgUp/PgDn", "Esc close"],
@@ -3620,19 +4176,31 @@ impl App {
                     let left = format!("[{}] {} {}", mode_text, self.status, dirty_text);
                     let hints: Vec<&str> = if self.quit_pending {
                         vec!["q force quit", ":wq save+quit", "any key cancel"]
+                    } else if self.archive_pending {
+                        vec!["a confirm", "any key cancel"]
                     } else if self.delete_pending {
                         vec!["d confirm", "any key cancel"]
+                    } else if selected_count > 0 && self.in_trash_view() {
+                        vec!["R restore", "P purge", "u clear"]
+                    } else if selected_count > 0 && self.in_archived_view() {
+                        vec!["a unarchive", "R unarchive", "D trash", "u clear"]
+                    } else if selected_count > 0 {
+                        vec!["a archive", "D trash", "p pin", "u clear"]
                     } else if self.notes_pane_collapsed {
                         vec!["j/k scroll", "PgUp/PgDn", "\\ notes", "F9 sort", "? help", "q quit"]
+                    } else if self.in_trash_view() {
+                        vec!["R restore", "P purge", ":empty-trash", "T exit trash", "? help"]
+                    } else if self.in_archived_view() {
+                        vec!["a unarchive", "R unarchive", "A exit archived", "? help"]
                     } else {
-                        vec![": command", "n new", "f folder", "/ search", "F9 sort", "? help", "q quit"]
+                        vec![": command", "x mark", "* all", "g tags", "/ search", "F9 sort", "? help"]
                     };
                     fit_footer_segments(&left, &hints, footer_width)
                 }
             }
         };
 
-        let status_style = if self.delete_pending {
+        let status_style = if self.delete_pending || self.archive_pending {
             Style::default()
                 .bg(palette.danger)
                 .fg(palette.bg)
@@ -3654,6 +4222,10 @@ impl App {
 
         if self.mode == Mode::Switcher {
             self.render_switcher_overlay(frame, palette);
+        }
+
+        if self.mode == Mode::Tags {
+            self.render_tag_browser_overlay(frame, palette);
         }
 
         if self.mode == Mode::Help {
@@ -3704,32 +4276,219 @@ impl App {
         } else {
             self.switcher_results
                 .iter()
-                .take(chunks[1].height as usize)
                 .enumerate()
                 .map(|(idx, note)| {
                     let selected = idx == self.switcher_cursor;
-                    let style = if selected {
-                        Style::default().bg(palette.accent).fg(palette.bg).add_modifier(Modifier::BOLD)
+                    let rail_style = if selected {
+                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.bg)
+                    };
+                    let title_style = if selected {
+                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(palette.text)
                     };
-                    let meta = if note.archived {
-                        " [archived]"
-                    } else if !note.folder.is_empty() {
-                        " [folder]"
+                    let meta = format!(
+                        "{}{}",
+                        if note.archived { "archived" } else { "active" },
+                        if note.folder.is_empty() { "".to_string() } else { format!("  /{}", note.folder) },
+                    );
+                    let snippet = if note.snippet.is_empty() {
+                        short_timestamp(&note.updated_at)
                     } else {
-                        ""
+                        note.snippet.replace(['[', ']'], "")
                     };
-                    ListItem::new(Line::from(vec![TSpan::styled(
-                        format!("{}{}", note.title, meta),
-                        style,
-                    )]))
+                    let meta_style = if selected {
+                        Style::default().fg(palette.text)
+                    } else {
+                        Style::default().fg(palette.muted)
+                    };
+                    let mut lines = vec![
+                        Line::from(vec![
+                            TSpan::styled(if selected { "▍ " } else { "  " }, rail_style),
+                            TSpan::styled(note.title.clone(), title_style),
+                        ]),
+                        Line::from(vec![TSpan::styled(
+                            format!("  {}  {}", meta, snippet),
+                            meta_style,
+                        )]),
+                    ];
+
+                    if !note.tags.is_empty() {
+                        let row_bg = palette.bg;
+                        let mut tag_spans = vec![TSpan::styled("  ".to_string(), Style::default().bg(row_bg))];
+                        for (tag_idx, tag) in note.tags.split_whitespace().enumerate() {
+                            if tag_idx > 0 {
+                                tag_spans.push(TSpan::raw(" "));
+                            }
+                            tag_spans.extend(tag_pill_spans(
+                                self.theme,
+                                tag,
+                                self.tag_color_key_for(tag),
+                                row_bg,
+                            ));
+                        }
+                        lines.push(Line::from(tag_spans));
+                    }
+
+                    ListItem::new(Text::from(lines))
                 })
                 .collect()
         };
         let mut list_state = ratatui::widgets::ListState::default();
         list_state.select(Some(self.switcher_cursor.min(items.len().saturating_sub(1))));
-        frame.render_stateful_widget(List::new(items), chunks[1], &mut list_state);
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default()),
+            chunks[1],
+            &mut list_state,
+        );
+    }
+
+    fn render_tag_browser_overlay(&mut self, frame: &mut Frame, palette: Palette) {
+        let area = frame.area();
+        let w = area.width.min(60);
+        let h = area.height.min(22);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect { x, y, width: w, height: h };
+        let title = match self.tag_browser_mode {
+            TagBrowserMode::Browse => " Tags ",
+            TagBrowserMode::Create => " Tags • New ",
+            TagBrowserMode::Color => " Tags • Color ",
+        };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.accent))
+            .style(Style::default().bg(palette.bg).fg(palette.text));
+        let inner = block.inner(popup);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(block, popup);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(4)])
+            .split(inner);
+
+        let items: Vec<ListItem> = if self.tag_browser_entries.is_empty() {
+            vec![ListItem::new(Line::styled("No tags yet", Style::default().fg(palette.muted)))]
+        } else {
+            self.tag_browser_entries
+                .iter()
+                .map(|entry| {
+                    let mut spans = vec![
+                        TSpan::styled(
+                            format!("#{}", entry.tag),
+                            Style::default()
+                                .fg(palette.text)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        TSpan::styled(
+                            format!(" ({})", entry.count),
+                            Style::default().fg(palette.muted),
+                        ),
+                    ];
+
+                    let color_label = entry.color.as_deref().unwrap_or("auto");
+                    spans.push(TSpan::styled("  ", Style::default()));
+                    spans.extend(tag_pill_spans(
+                        self.theme,
+                        &entry.tag,
+                        entry.color.as_deref(),
+                        palette.bg,
+                    ));
+                    spans.push(TSpan::styled(
+                        format!("  {}", color_label),
+                        Style::default().fg(palette.muted),
+                    ));
+
+                    ListItem::new(Line::from(spans))
+                })
+                .collect()
+        };
+        let mut list_state = ratatui::widgets::ListState::default();
+        list_state.select(Some(self.tag_browser_cursor.min(items.len().saturating_sub(1))));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(
+                Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+            ),
+            chunks[0],
+            &mut list_state,
+        );
+
+        let detail_lines: Vec<Line> = match self.tag_browser_mode {
+            TagBrowserMode::Browse => {
+                if let Some(entry) = self.selected_tag_entry() {
+                    vec![
+                        Line::from(vec![
+                            TSpan::styled("Selected ", Style::default().fg(palette.muted)),
+                            TSpan::styled(format!("#{}", entry.tag), Style::default().fg(palette.text).add_modifier(Modifier::BOLD)),
+                            TSpan::styled(
+                                format!("  {} note{}", entry.count, if entry.count == 1 { "" } else { "s" }),
+                                Style::default().fg(palette.muted),
+                            ),
+                        ]),
+                        Line::from(vec![
+                            TSpan::styled("Color ", Style::default().fg(palette.muted)),
+                            TSpan::styled(
+                                entry.color.as_deref().unwrap_or("auto"),
+                                Style::default().fg(palette.accent),
+                            ),
+                            TSpan::styled("  n new  c color  Enter filter", Style::default().fg(palette.muted)),
+                        ]),
+                    ]
+                } else {
+                    vec![
+                        Line::styled("Create your first tag with n", Style::default().fg(palette.muted)),
+                        Line::styled("Enter filters notes by the selected tag", Style::default().fg(palette.muted)),
+                    ]
+                }
+            }
+            TagBrowserMode::Create => vec![
+                Line::from(vec![
+                    TSpan::styled("New tag ", Style::default().fg(palette.muted)),
+                    TSpan::styled(format!("#{}█", self.tag_browser_input), Style::default().fg(palette.text)),
+                ]),
+                Line::styled(
+                    "Letters, numbers, '-' and '_' only. Enter creates, then opens color picker.",
+                    Style::default().fg(palette.muted),
+                ),
+            ],
+            TagBrowserMode::Color => {
+                let choices = self.theme.tag_color_choices();
+                let current_name = self.selected_tag_name().unwrap_or("");
+                let mut palette_line = vec![
+                    TSpan::styled("auto", color_choice_style(self.tag_color_cursor == 0, palette)),
+                ];
+                for (idx, choice) in choices.iter().enumerate() {
+                    palette_line.push(TSpan::raw(" "));
+                    let selected = self.tag_color_cursor == idx + 1;
+                    for span in color_choice_spans(*choice, self.theme, selected, palette.bg) {
+                        palette_line.push(span);
+                    }
+                }
+
+                let label = if self.tag_color_cursor == 0 {
+                    "auto".to_string()
+                } else {
+                    choices[self.tag_color_cursor - 1].label.to_string()
+                };
+
+                vec![
+                    Line::from(vec![
+                        TSpan::styled(format!("Color for #{} ", current_name), Style::default().fg(palette.muted)),
+                        TSpan::styled(label, Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(palette_line),
+                ]
+            }
+        };
+
+        let detail = Paragraph::new(detail_lines)
+            .style(Style::default().bg(palette.bg).fg(palette.text))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(detail, chunks[1]);
     }
 
 
@@ -3779,8 +4538,10 @@ impl App {
             row(":",               "command palette"),
             row("\\",              "toggle notes pane"),
             row("Ctrl+P",          "quick switcher"),
-            row("p / a",           "pin / archive selected note"),
-            row("A / T",           "show archived / trash"),
+            row("g",               "browse and manage tags"),
+            row("x / * / u",       "mark / all / clear"),
+            row("p",               "pin / unpin selected note"),
+            row("A / T",           "toggle archived / trash view"),
             row("F9",              "cycle sort"),
             row("q",               "quit"),
             pad(),
@@ -3815,26 +4576,45 @@ impl App {
             row("#tag",            "filter by tag (first line of note)"),
             row("/folder",         "filter by folder"),
             row(":archived",       "show archived"),
+            row(":trash",          "show trash"),
+            pad(),
+            heading("  TAG BROWSER"),
+            row("Enter",           "filter notes by selected tag"),
+            row("n",               "create a new tag"),
+            row("c / e",           "choose a color for selected tag"),
+            row("Esc",             "close browser / cancel tag edit"),
+            pad(),
+            heading("  TRASH / ARCHIVE"),
+            row("a",               "archive, confirm archive, or unarchive"),
+            row("A",               "toggle archived view"),
+            row("T",               "toggle trash view"),
+            row("D",               "move selected note(s) to trash"),
+            row("R",               "restore from trash / unarchive in archived view"),
+            row("P",               "permanently delete selected note(s) in trash"),
+            row(":archive / :archive!", "archive current note / force confirm"),
+            row(":unarchive",      "restore archived note"),
+            row(":trash",          "show trash"),
+            row(":restore",        "restore selected trash note"),
+            row(":purge",          "permanently delete selected trash note"),
+            row(":empty-trash",    "permanently delete all trashed notes"),
             pad(),
             heading("  COMMANDS  (:)"),
             row(":new",            "create note"),
+            row(":import <path>",  "import file(s) as notes"),
+            row(":export <path>",  "export current note"),
             row(":edit",           "enter edit mode"),
             row(":rename <title>", "rename note"),
             row(":folder <name>",  "move to folder (empty = root)"),
             row(":unfolder",       "remove from folder (move to root)"),
             row(":tag / :untag",   "add/remove #tag on first line"),
             row(":pin / :unpin",   "pin to top"),
-            row(":archive",        "hide from list"),
-            row(":unarchive",      "restore archived"),
             row(":discard",        "discard unsaved changes"),
             row(":search <q>",     "search"),
             row(":reload",         "refresh list from disk"),
             row(":theme <name>",   "neo-noir|paper|matrix"),
             row(":keymap <name>",  "default|vim"),
             row(":sort <mode>",    "manual|updated|title"),
-            row(":trash",          "show trash"),
-            row(":restore",        "restore selected trash note"),
-            row(":purge",          "permanently delete selected trash note"),
+            row(":tags",           "browse and manage tags"),
             pad(),
             Line::from(vec![dim("  F6 theme  F7 keymap  F8 density  F9 sort  "), key("?/Esc"), dim(" close")]),
             pad(),
@@ -3908,26 +4688,80 @@ fn truncate_with_ellipsis(text: &str, width: usize) -> String {
     out
 }
 
+fn parse_command_parts(command: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '"' | '\'' => {
+                if quote == Some(ch) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(ch);
+                } else {
+                    current.push(ch);
+                }
+            }
+            c if c.is_whitespace() && quote.is_none() => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 fn tag_color_idx(tag: &str, len: usize) -> usize {
     tag.bytes()
         .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize))
         % len
 }
 
-fn pill_style_for_tag(tag: &str, colors: &[(Color, Color)]) -> Style {
-    let (bg, fg) = colors[tag_color_idx(tag, colors.len())];
-    Style::default().bg(bg).fg(fg)
+fn tag_color_choice_index(key: Option<&str>) -> usize {
+    match key {
+        None | Some("") => 0,
+        Some(key) => TAG_COLOR_CHOICES
+            .iter()
+            .position(|choice| choice.key == key)
+            .map(|idx| idx + 1)
+            .unwrap_or(0),
+    }
 }
 
-fn tag_dot_style(tag: &str, colors: &[(Color, Color)]) -> Style {
-    let (bg, _) = colors[tag_color_idx(tag, colors.len())];
+fn resolve_tag_colors(theme: ThemeName, tag: &str, color_key: Option<&str>) -> (Color, Color) {
+    if let Some(key) = color_key {
+        if let Some(choice) = theme.tag_color_choices().iter().find(|choice| choice.key == key) {
+            return choice.colors(theme);
+        }
+    }
+
+    let choices = theme.tag_color_choices();
+    choices[tag_color_idx(tag, choices.len())].colors(theme)
+}
+
+fn tag_dot_style(theme: ThemeName, tag: &str, color_key: Option<&str>) -> Style {
+    let (bg, _) = resolve_tag_colors(theme, tag, color_key);
     Style::default().fg(bg)
 }
 
 ///// Returns spans for a rounded pill using Nerd Font powerline glyphs (requires Nerd Font).
 /// `row_bg` should be the background color of the containing row so the caps blend in.
-fn tag_pill_spans(tag: &str, colors: &[(Color, Color)], row_bg: Color) -> Vec<TSpan<'static>> {
-    let (bg, fg) = colors[tag_color_idx(tag, colors.len())];
+fn tag_pill_spans(theme: ThemeName, tag: &str, color_key: Option<&str>, row_bg: Color) -> Vec<TSpan<'static>> {
+    let (bg, fg) = resolve_tag_colors(theme, tag, color_key);
     let cap = Style::default().fg(bg).bg(row_bg);
     let body = Style::default().bg(bg).fg(fg);
     vec![
@@ -3935,6 +4769,32 @@ fn tag_pill_spans(tag: &str, colors: &[(Color, Color)], row_bg: Color) -> Vec<TS
         TSpan::styled(format!("#{} ", tag), body),
         TSpan::styled("\u{E0B4}", cap),
     ]
+}
+
+fn color_choice_style(selected: bool, palette: Palette) -> Style {
+    let mut style = Style::default().fg(palette.muted);
+    if selected {
+        style = style.fg(palette.accent).add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
+fn color_choice_spans(
+    choice: TagColorChoice,
+    theme: ThemeName,
+    selected: bool,
+    row_bg: Color,
+) -> Vec<TSpan<'static>> {
+    let mut spans = tag_pill_spans(theme, choice.key, Some(choice.key), row_bg);
+    spans.push(TSpan::styled(
+        format!(" {}", choice.label),
+        if selected {
+            Style::default().fg(choice.colors(theme).0).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(choice.colors(theme).0)
+        },
+    ));
+    spans
 }
 
 fn short_timestamp(ts: &str) -> String {
@@ -4289,7 +5149,7 @@ fn fix_fences(text: &str) -> String {
         .collect()
 }
 
-fn render_markdown_preview(text: &str, palette: Palette, _width: usize, syntax_set: &SyntaxSet, theme_set: &ThemeSet) -> Text<'static> {
+fn render_markdown_preview(text: &str, palette: Palette, _width: usize, syntax_set: &SyntaxSet, theme_set: &ThemeSet, highlight_terms: &[String]) -> Text<'static> {
     let fixed = fix_fences(text);
     let opts = MdOptions::ENABLE_STRIKETHROUGH | MdOptions::ENABLE_TABLES;
     let parser = MdParser::new_ext(&fixed, opts);
@@ -4491,7 +5351,82 @@ fn render_markdown_preview(text: &str, palette: Palette, _width: usize, syntax_s
 
     let _ = in_code;
 
-    Text::from(lines)
+    if highlight_terms.is_empty() {
+        Text::from(lines)
+    } else {
+        Text::from(highlight_preview_lines(lines, highlight_terms, palette))
+    }
+}
+
+fn preview_highlight_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter(|token| {
+            !token.starts_with('#')
+                && !token.starts_with('/')
+                && !token.starts_with(':')
+                && !token.is_empty()
+        })
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn highlight_preview_lines(lines: Vec<Line<'static>>, terms: &[String], palette: Palette) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let text: String = line.spans.iter().map(|span| span.content.to_string()).collect();
+            if text.is_empty() {
+                return line;
+            }
+            let lower = text.to_ascii_lowercase();
+            let mut marks = vec![false; lower.chars().count()];
+            let chars: Vec<char> = lower.chars().collect();
+            for term in terms {
+                let tchars: Vec<char> = term.chars().collect();
+                if tchars.is_empty() || tchars.len() > chars.len() {
+                    continue;
+                }
+                for i in 0..=chars.len().saturating_sub(tchars.len()) {
+                    if chars[i..i + tchars.len()] == tchars[..] {
+                        for mark in marks.iter_mut().skip(i).take(tchars.len()) {
+                            *mark = true;
+                        }
+                    }
+                }
+            }
+
+            if !marks.iter().any(|marked| *marked) {
+                return line;
+            }
+
+            let mut spans = Vec::new();
+            let source_chars: Vec<char> = text.chars().collect();
+            let mut current = String::new();
+            let mut current_mark = marks[0];
+            for (idx, ch) in source_chars.iter().enumerate() {
+                if marks[idx] != current_mark {
+                    let style = if current_mark {
+                        Style::default().bg(palette.ok).fg(palette.bg).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.text)
+                    };
+                    spans.push(TSpan::styled(std::mem::take(&mut current), style));
+                    current_mark = marks[idx];
+                }
+                current.push(*ch);
+            }
+            if !current.is_empty() {
+                let style = if current_mark {
+                    Style::default().bg(palette.ok).fg(palette.bg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(palette.text)
+                };
+                spans.push(TSpan::styled(current, style));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 #[cfg(test)]
