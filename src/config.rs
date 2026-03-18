@@ -4,10 +4,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub theme: String,
     pub keymap: String,
     pub density: String,
+    pub sort: String,
+    pub last_open_note_id: Option<i64>,
 }
 
 impl Default for AppConfig {
@@ -16,6 +19,8 @@ impl Default for AppConfig {
             theme: "neo-noir".to_string(),
             keymap: "default".to_string(),
             density: "cozy".to_string(),
+            sort: "manual".to_string(),
+            last_open_note_id: None,
         }
     }
 }

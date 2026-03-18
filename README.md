@@ -83,9 +83,10 @@ ANOTE_CONFIG_PATH=/path/to/config.toml cargo run
 theme   = "neo-noir"   # neo-noir | paper | matrix
 keymap  = "default"    # default | vim
 density = "cozy"       # cozy | compact
+sort    = "manual"     # manual | updated | title
 ```
 
-All fields are optional — missing fields fall back to the defaults above. Changes to `theme` and `keymap` can also be made at runtime via `:theme <name>` and `:keymap <name>` in the command palette (they are written back to the config file automatically).
+All fields are optional — missing fields fall back to the defaults above. The config file also stores the last-open note automatically so the TUI can restore your place on startup. Changes to `theme`, `keymap`, and `sort` can also be made at runtime via `:theme <name>`, `:keymap <name>`, and `:sort <mode>` in the command palette.
 
 ## TUI keybindings
 
@@ -105,6 +106,7 @@ All fields are optional — missing fields fall back to the defaults above. Chan
 | `q` | quit |
 | `F6` | cycle theme |
 | `F7` | cycle keymap |
+| `F9` | cycle sort mode |
 
 ### Collapsed pane (preview only)
 
@@ -182,8 +184,10 @@ Navigation phase (after Enter):
 | `:search <query>` | run a search programmatically |
 | `:theme <name>` | `neo-noir` \| `paper` \| `matrix` |
 | `:keymap <name>` | `default` \| `vim` |
+| `:sort <mode>` | `manual` \| `updated` \| `title` |
 | `:reload` | refresh note list |
 | `:w` | save |
+| `:wq` / `:x` | save and quit |
 | `:q` / `:quit` | quit |
 
 ## Tags

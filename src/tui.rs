@@ -242,6 +242,40 @@ impl Density {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    Manual,
+    Updated,
+    Title,
+}
+
+impl SortMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Manual => Self::Updated,
+            Self::Updated => Self::Title,
+            Self::Title => Self::Manual,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Updated => "updated",
+            Self::Title => "title",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "manual" => Some(Self::Manual),
+            "updated" | "recent" => Some(Self::Updated),
+            "title" | "alpha" | "alphabetical" => Some(Self::Title),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Palette {
     bg: Color,
@@ -525,6 +559,7 @@ pub struct App {
     theme: ThemeName,
     keymap: KeymapPreset,
     density: Density,
+    sort_mode: SortMode,
     config_path: PathBuf,
     linter: LintGroup,
     lints: Vec<harper_core::linting::Lint>,
@@ -550,6 +585,7 @@ pub struct App {
     preview_scroll: u16,
     help_scroll: u16,
     editor_scroll: usize,
+    quit_pending: bool,
 }
 
 impl App {
@@ -576,6 +612,7 @@ impl App {
             theme: ThemeName::from_label(&config.theme).unwrap_or(ThemeName::NeoNoir),
             keymap: KeymapPreset::from_label(&config.keymap).unwrap_or(KeymapPreset::Default),
             density: Density::from_label(&config.density).unwrap_or(Density::Cozy),
+            sort_mode: SortMode::from_label(&config.sort).unwrap_or(SortMode::Manual),
             config_path,
             linter: {
                 let mut lg = LintGroup::new_curated(FstDictionary::curated(), Dialect::American);
@@ -605,9 +642,14 @@ impl App {
             preview_scroll: 0,
             help_scroll: 0,
             editor_scroll: 0,
+            quit_pending: false,
         };
         app.apply_editor_keymap();
         app.refresh_notes()?;
+        if let Some(id) = config.last_open_note_id {
+            app.select_by_id(id);
+        }
+        app.sync_active_note_from_cursor()?;
         Ok(app)
     }
 
@@ -736,6 +778,10 @@ impl App {
                 self.status = format!("Density -> {}", self.density.label());
                 return Ok(false);
             }
+            KeyCode::F(9) => {
+                self.set_sort_mode(self.sort_mode.next())?;
+                return Ok(false);
+            }
             _ => {}
         }
 
@@ -775,10 +821,40 @@ impl App {
             theme: self.theme.label().to_string(),
             keymap: self.keymap.label().to_string(),
             density: self.density.label().to_string(),
+            sort: self.sort_mode.label().to_string(),
+            last_open_note_id: self.active_note_id,
         };
         if let Err(err) = config.save(&self.config_path) {
             self.status = format!("Config save failed: {}", err);
         }
+    }
+
+    fn set_sort_mode(&mut self, sort_mode: SortMode) -> Result<()> {
+        self.sort_mode = sort_mode;
+        self.refresh_notes()?;
+        if let Some(id) = self.active_note_id {
+            self.select_by_id(id);
+        }
+        self.sync_active_note_from_cursor()?;
+        self.persist_preferences();
+        self.status = format!("Sort -> {}", self.sort_mode.label());
+        Ok(())
+    }
+
+    fn save_and_quit(&mut self) -> Result<bool> {
+        if self.dirty {
+            self.save_active_note()?;
+        }
+        Ok(true)
+    }
+
+    fn request_quit(&mut self) -> Result<bool> {
+        if self.dirty && !self.quit_pending {
+            self.quit_pending = true;
+            self.status = "Unsaved changes. q quit without saving, :wq save and quit, any other key cancel".to_string();
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn apply_editor_keymap(&mut self) {
@@ -993,8 +1069,13 @@ impl App {
             return Ok(false);
         }
 
+        if self.quit_pending && key.code != KeyCode::Char('q') {
+            self.quit_pending = false;
+            self.status = "Quit canceled".to_string();
+        }
+
         if key.code == KeyCode::Char('q') {
-            return Ok(true);
+            return self.request_quit();
         }
 
         if key.code == KeyCode::Char('\\') {
@@ -1211,6 +1292,7 @@ impl App {
             }
             _ => {
                 self.delete_pending = false;
+                self.quit_pending = false;
             }
         }
         Ok(false)
@@ -1782,16 +1864,14 @@ impl App {
         let name = parts.next().unwrap_or_default().to_ascii_lowercase();
 
         match name.as_str() {
-            "q" | "quit" => return Ok(true),
+            "q" | "quit" => return self.request_quit(),
             "w" => {
                 self.save_active_note()?;
                 self.status = "Saved".to_string();
             }
             "wq" | "x" => {
-                self.save_active_note()?;
-                self.mode = Mode::Normal;
                 self.status = "Saved".to_string();
-                return Ok(true);
+                return self.save_and_quit();
             }
             "new" => {
                 let id = self.store.create_note("Untitled", "")?;
@@ -1842,6 +1922,14 @@ impl App {
                     self.status = format!("Keymap -> {}", keymap.label());
                 } else {
                     self.status = "Usage: :keymap default|vim".to_string();
+                }
+            }
+            "sort" => {
+                let arg = parts.next().unwrap_or("");
+                if let Some(sort_mode) = SortMode::from_label(arg) {
+                    self.set_sort_mode(sort_mode)?;
+                } else {
+                    self.status = "Usage: :sort manual|updated|title".to_string();
                 }
             }
             "folder" => {
@@ -2010,7 +2098,8 @@ impl App {
         self.tree.clear();
         let folders = self.store.list_folders()?;
         let query = self.query.clone();
-        let root_notes = self.store.list_notes_in_folder("", &query)?;
+        let mut root_notes = self.store.list_notes_in_folder("", &query)?;
+        self.sort_note_summaries(&mut root_notes);
         let max_folder_order = folders.iter().map(|folder| folder.sort_order).max().unwrap_or(0);
 
         #[derive(Clone)]
@@ -2023,11 +2112,15 @@ impl App {
         for folder in folders {
             top_level.push((folder.sort_order, 0, TopLevelItem::Folder(folder)));
         }
-        for note in root_notes {
-            let effective_order = if note.note_order == 0 {
-                max_folder_order + 1
+        for (idx, note) in root_notes.into_iter().enumerate() {
+            let effective_order = if self.sort_mode == SortMode::Manual {
+                if note.note_order == 0 {
+                    max_folder_order + 1
+                } else {
+                    note.note_order
+                }
             } else {
-                note.note_order
+                max_folder_order + ((idx as i64) + 1) * 10
             };
             let pin_rank = if note.pinned { 0 } else { 1 };
             top_level.push((effective_order, pin_rank, TopLevelItem::RootNote(note)));
@@ -2038,7 +2131,8 @@ impl App {
             match item {
                 TopLevelItem::Folder(folder) => {
                     let expanded = self.tree_expanded.contains(&folder.name);
-                    let notes_in_folder = self.store.list_notes_in_folder(&folder.name, &query)?;
+                    let mut notes_in_folder = self.store.list_notes_in_folder(&folder.name, &query)?;
+                    self.sort_note_summaries(&mut notes_in_folder);
                     let note_count = notes_in_folder.len();
                     self.tree.push(TreeItem::Folder {
                         name: folder.name,
@@ -2076,12 +2170,32 @@ impl App {
                 if let Some(note) = self.store.get_note(summary.id)? {
                     self.load_note_into_editor(&note.body);
                 }
+                self.persist_preferences();
             }
         } else if self.tree.is_empty() {
             self.active_note_id = None;
             self.load_note_into_editor("");
+            self.persist_preferences();
         }
         Ok(())
+    }
+
+    fn sort_note_summaries(&self, notes: &mut [NoteSummary]) {
+        match self.sort_mode {
+            SortMode::Manual => {}
+            SortMode::Updated => notes.sort_by(|a, b| {
+                b.pinned
+                    .cmp(&a.pinned)
+                    .then(b.updated_at.cmp(&a.updated_at))
+                    .then_with(|| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+            }),
+            SortMode::Title => notes.sort_by(|a, b| {
+                b.pinned
+                    .cmp(&a.pinned)
+                    .then_with(|| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+                    .then(b.updated_at.cmp(&a.updated_at))
+            }),
+        }
     }
 
     fn load_note_into_editor(&mut self, body: &str) {
@@ -2948,9 +3062,10 @@ impl App {
         let top_text = Text::from(Line::from(vec![
             TSpan::styled(
                 format!(
-                    " anote  theme:{}  keymap:{}  notes:{}  {}",
+                    " anote  theme:{}  keymap:{}  sort:{}  notes:{}  {}",
                     self.theme.label(),
                     self.keymap.label(),
+                    self.sort_mode.label(),
                     note_count,
                     query_tag
                 ),
@@ -2991,8 +3106,15 @@ impl App {
             let tree_len = self.tree.len();
 
             if tree_len == 0 && self.tree_inline_mode != TreeInlineMode::CreateFolder {
+                let empty_message = if self.query.is_empty() {
+                    "No notes yet. Press 'n' to create or 'f' for a folder.".to_string()
+                } else if self.query.contains(":archived") {
+                    format!("No archived notes match '{}'. Press '/' to refine.", self.query)
+                } else {
+                    format!("No notes match '{}'. Press '/' to refine or clear the search.", self.query)
+                };
                 items.push(ListItem::new(Line::styled(
-                    "No notes. Press 'n' to create, 'f' for folder.",
+                    empty_message,
                     Style::default().fg(palette.muted),
                 )));
             }
@@ -3300,12 +3422,14 @@ impl App {
                     fit_footer_left(&inline_hint, footer_width)
                 } else {
                     let left = format!("[{}] {} {}", mode_text, self.status, dirty_text);
-                    let hints: Vec<&str> = if self.delete_pending {
+                    let hints: Vec<&str> = if self.quit_pending {
+                        vec!["q force quit", ":wq save+quit", "any key cancel"]
+                    } else if self.delete_pending {
                         vec!["d confirm", "any key cancel"]
                     } else if self.notes_pane_collapsed {
-                        vec!["j/k scroll", "PgUp/PgDn", "\\ notes", "? help", "q quit"]
+                        vec!["j/k scroll", "PgUp/PgDn", "\\ notes", "F9 sort", "? help", "q quit"]
                     } else {
-                        vec![": command", "n new", "f folder", "/ search", "? help", "q quit"]
+                        vec![": command", "n new", "f folder", "/ search", "F9 sort", "? help", "q quit"]
                     };
                     fit_footer_segments(&left, &hints, footer_width)
                 }
@@ -3383,6 +3507,7 @@ impl App {
             row("/",               "search notes"),
             row(":",               "command palette"),
             row("\\",              "toggle notes pane"),
+            row("F9",              "cycle sort"),
             row("q",               "quit"),
             pad(),
             heading("  COLLAPSED PANE"),
@@ -3432,8 +3557,9 @@ impl App {
             row(":reload",         "refresh list from disk"),
             row(":theme <name>",   "neo-noir|paper|matrix"),
             row(":keymap <name>",  "default|vim"),
+            row(":sort <mode>",    "manual|updated|title"),
             pad(),
-            Line::from(vec![dim("  F6 theme  F7 keymap  F8 density  "), key("?/Esc"), dim(" close")]),
+            Line::from(vec![dim("  F6 theme  F7 keymap  F8 density  F9 sort  "), key("?/Esc"), dim(" close")]),
             pad(),
         ];
 
