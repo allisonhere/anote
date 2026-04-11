@@ -2,6 +2,8 @@
 
 Keyboard-first TUI note-taking app in Rust.
 
+![anote screenshot](./screenshot.png)
+
 ## Features
 
 - SQLite-backed notes with FTS5 full-text search
@@ -94,6 +96,17 @@ All fields are optional — missing fields fall back to the defaults above. The 
 
 ## TUI keybindings
 
+### Primary flows
+
+| Task | Primary path |
+|------|--------------|
+| Edit a note | select it, then `Enter` |
+| Jump to a note | `Ctrl+P` |
+| Search notes | `/` |
+| Browse tags | `g` |
+| Browse archive / trash | `A` / `T` |
+| Bulk actions | `x` to mark, then act |
+
 ### Normal mode
 
 | Key | Action |
@@ -103,7 +116,7 @@ All fields are optional — missing fields fall back to the defaults above. The 
 | `e` or `Enter` | open note in editor |
 | `d d` | delete note |
 | `/` | search / filter notes |
-| `:` | command palette |
+| `:` | power tools / command palette |
 | `\` | toggle notes pane |
 | `Ctrl+P` | quick switcher |
 | `g` | browse and manage tags |
@@ -170,8 +183,6 @@ Navigation phase (after Enter):
 |-------|--------|
 | `#tag` | filter by tag |
 | `/folder` | filter by folder |
-| `:archived` | open archive browser on Enter |
-| `:trash` | open trash browser on Enter |
 | plain text | full-text search |
 
 ### Tag browser (`g` or `:tags`)
@@ -200,14 +211,6 @@ Navigation phase (after Enter):
 | `P` | purge in trash browser |
 | `x` / `*` / `u` | mark / all / clear inside archive or trash browser |
 | typing / `Backspace` | live-filter archive or trash browser results |
-| `:archive` | arm archive confirmation for the current note |
-| `:archive!` | confirm and archive immediately |
-| `:unarchive` | unarchive the current note |
-| `:archived` | open archive browser |
-| `:trash` | open trash browser |
-| `:restore` | restore the current trashed note |
-| `:purge` | permanently delete the current trashed note |
-| `:empty-trash` | permanently delete all trashed notes |
 
 ### Vim keymap extras
 
@@ -221,7 +224,7 @@ Navigation phase (after Enter):
 | `u` / `Ctrl+R` | undo / redo |
 | `l` (normal mode) | open selected note from notes pane |
 
-## Command palette
+## Power tools (`:`)
 
 | Command | Description |
 |---------|-------------|
@@ -236,7 +239,11 @@ Navigation phase (after Enter):
 | `:keymap <name>` | `default` \| `vim` |
 | `:sort <mode>` | `manual` \| `updated` \| `title` |
 | `:tags` | browse and manage tags |
-| `:archived` | open archive browser |
+| `:archive` / `:archive!` | arm archive confirmation / archive immediately |
+| `:unarchive` | unarchive the current note |
+| `:archived` / `:trash` | open archive / trash browser |
+| `:restore` / `:purge` | restore or permanently delete the current trashed note |
+| `:empty-trash` | permanently delete all trashed notes |
 | `:reload` | refresh note list |
 | `:w` | save |
 | `:wq` / `:x` | save and quit |
