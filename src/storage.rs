@@ -274,6 +274,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn find_note_by_title(&self, title: &str) -> Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM notes WHERE title = ?1 LIMIT 1")?;
+        let id = stmt.query_row([title], |row| row.get(0)).optional()?;
+        Ok(id)
+    }
+
     pub fn get_note(&self, id: i64) -> Result<Option<Note>> {
         let mut stmt = self.conn.prepare("SELECT body FROM notes WHERE id = ?1")?;
         let note = stmt
@@ -293,9 +301,7 @@ impl Store {
         title_locked: bool,
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
-        let note_title = if title_locked {
-            title.trim().to_string()
-        } else if body.trim().is_empty() {
+        let note_title = if title_locked || body.trim().is_empty() {
             title.trim().to_string()
         } else {
             derive_title(body)
@@ -459,12 +465,11 @@ impl Store {
         let (tags, folder_filter, query_archived, query_trash, fts) = parse_query(query);
         let show_archived = forced_archived || query_archived;
         let show_trash = forced_trash || query_trash;
-        if let Some(scope) = folder_scope {
-            if let Some(filter) = folder_filter.as_deref() {
-                if !scope.eq_ignore_ascii_case(filter) {
-                    return Ok(Vec::new());
-                }
-            }
+        if let Some(scope) = folder_scope
+            && let Some(filter) = folder_filter.as_deref()
+            && !scope.eq_ignore_ascii_case(filter)
+        {
+            return Ok(Vec::new());
         }
 
         let mut where_clauses: Vec<String> = Vec::new();

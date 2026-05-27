@@ -1,6 +1,10 @@
 mod config;
+mod editor;
+mod render;
 mod storage;
 mod tui;
+mod types;
+mod utils;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -64,11 +68,32 @@ enum Commands {
         query: String,
     },
 
-    /// Delete a note by ID
+    /// Delete a note by ID (soft-delete, moves to trash)
     Delete {
         /// Note ID(s) to delete
         #[arg(required = true)]
         ids: Vec<i64>,
+    },
+
+    /// Restore a trashed note by ID
+    Restore {
+        /// Note ID(s) to restore
+        #[arg(required = true)]
+        ids: Vec<i64>,
+    },
+
+    /// Permanently delete a trashed note by ID
+    Purge {
+        /// Note ID(s) to purge
+        #[arg(required = true)]
+        ids: Vec<i64>,
+    },
+
+    /// List all tags and their counts
+    ListTags {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Open the TUI with a specific note selected
@@ -76,6 +101,9 @@ enum Commands {
         /// Note ID
         id: i64,
     },
+
+    /// Open today's daily note (creates it with a template if it doesn't exist)
+    Daily,
 }
 
 fn main() -> Result<()> {
@@ -124,7 +152,14 @@ fn main() -> Result<()> {
             match store.get_note(id)? {
                 None => bail!("note {} not found", id),
                 Some(note) => match output {
-                    None => print!("{}", note.body),
+                    None => {
+                        let body = note.body;
+                        if body.ends_with('\n') {
+                            print!("{}", body);
+                        } else {
+                            println!("{}", body);
+                        }
+                    }
                     Some(path) => {
                         std::fs::write(&path, &note.body)
                             .with_context(|| format!("failed to write {}", path.display()))?;
@@ -174,9 +209,52 @@ fn main() -> Result<()> {
             }
         }
 
+        Some(Commands::Restore { ids }) => {
+            for id in ids {
+                store.restore_note(id)?;
+                println!("restored note {}", id);
+            }
+        }
+
+        Some(Commands::Purge { ids }) => {
+            for id in ids {
+                store.purge_note(id)?;
+                println!("purged note {}", id);
+            }
+        }
+
+        Some(Commands::ListTags { json }) => {
+            let tags = store.list_tags()?;
+            if json {
+                println!("[");
+                for (i, tag) in tags.iter().enumerate() {
+                    let comma = if i + 1 < tags.len() { "," } else { "" };
+                    println!(
+                        "  {{\"tag\":{},\"count\":{},\"color\":{}}}{}",
+                        json_str(&tag.tag),
+                        tag.count,
+                        json_str(&tag.color.clone().unwrap_or_default()),
+                        comma
+                    );
+                }
+                println!("]");
+            } else {
+                for tag in tags {
+                    let color = tag.color.as_deref().unwrap_or("-");
+                    println!("{}\t{}\t{}", tag.tag, tag.count, color);
+                }
+            }
+        }
+
         Some(Commands::Edit { id }) => {
             let mut app = App::new(store)?;
             app.open_note_id(id, false)?;
+            app.run()?;
+        }
+
+        Some(Commands::Daily) => {
+            let mut app = App::new(store)?;
+            app.open_daily_note()?;
             app.run()?;
         }
     }
@@ -185,5 +263,22 @@ fn main() -> Result<()> {
 }
 
 fn json_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let code = c as u32;
+                out.push_str(&format!("\\u{:04x}", code));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

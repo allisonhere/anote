@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::Local;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
@@ -27,10 +28,6 @@ use ratatui::{
 };
 
 use harper_core::linting::{LintGroup, Linter};
-use pulldown_cmark::{
-    CodeBlockKind, Event as MdEvent, HeadingLevel, Options as MdOptions, Parser as MdParser,
-    Tag as MdTag, TagEnd as MdTagEnd,
-};
 use harper_core::parsers::PlainEnglish;
 use harper_core::spell::FstDictionary;
 use harper_core::{Dialect, Document};
@@ -42,559 +39,24 @@ use syntect::parsing::SyntaxSet;
 use crate::config::AppConfig;
 use crate::storage::{NoteSummary, Store, TagEntry};
 
+use crate::editor::EditorBuffer;
+use crate::types::{
+    Density, KeymapPreset, Mode, Palette, SortMode,
+    TagBrowserMode, ThemeName, TreeInlineMode, TreeItem,
+    command_palette_entries,
+};
+use crate::render::{
+    append_tag_to_body, body_has_tag, build_spans_for_row, color_choice_entry_spans,
+    markdown_highlight_line, preview_highlight_terms, remove_tag_from_body,
+    render_markdown_preview, tag_color_choice_index,
+    tag_dot_style, tag_pill_spans, merge_ranges,
+};
+use crate::utils::{fit_footer_left, fit_footer_segments, parse_command_parts, short_timestamp};
+
 // arboard is optional at runtime (no display server): treat errors as no-op.
 use arboard::Clipboard;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Normal,
-    Edit,
-    Search,
-    Command,
-    Find,
-    Switcher,
-    ArchiveBrowser,
-    TrashBrowser,
-    Tags,
-    Help,
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TagBrowserMode {
-    Browse,
-    Create,
-    Color,
-    DeleteConfirm,
-}
-
-#[derive(Debug, Clone)]
-enum TreeItem {
-    Folder {
-        name: String,
-        expanded: bool,
-        note_count: usize,
-    },
-    Note(NoteSummary),
-}
-
-impl TreeItem {
-    fn is_note(&self) -> bool { matches!(self, TreeItem::Note(_)) }
-    fn note(&self) -> Option<&NoteSummary> {
-        match self { TreeItem::Note(n) => Some(n), _ => None }
-    }
-    fn folder_name(&self) -> Option<&str> {
-        match self { TreeItem::Folder { name, .. } => Some(name), _ => None }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TreeInlineMode {
-    None,
-    CreateFolder,
-    RenameFolder(String),
-    RenameNote(i64),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThemeName {
-    NeoNoir,
-    Paper,
-    Matrix,
-}
-
-impl ThemeName {
-    fn next(self) -> Self {
-        match self {
-            Self::NeoNoir => Self::Paper,
-            Self::Paper => Self::Matrix,
-            Self::Matrix => Self::NeoNoir,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::NeoNoir => "neo-noir",
-            Self::Paper => "paper",
-            Self::Matrix => "matrix",
-        }
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        match label.trim().to_ascii_lowercase().as_str() {
-            "neo-noir" | "neonoir" | "neo" => Some(Self::NeoNoir),
-            "paper" => Some(Self::Paper),
-            "matrix" => Some(Self::Matrix),
-            _ => None,
-        }
-    }
-
-    fn palette(self) -> Palette {
-        match self {
-            Self::NeoNoir => Palette {
-                bg: Color::Rgb(12, 14, 18),
-                panel: Color::Rgb(18, 23, 31),
-                text: Color::Rgb(226, 232, 240),
-                muted: Color::Rgb(128, 142, 160),
-                accent: Color::Rgb(56, 189, 248),
-                danger: Color::Rgb(248, 113, 113),
-                ok: Color::Rgb(74, 222, 128),
-            },
-            Self::Paper => Palette {
-                bg: Color::Rgb(246, 242, 230),
-                panel: Color::Rgb(255, 252, 245),
-                text: Color::Rgb(31, 41, 55),
-                muted: Color::Rgb(107, 114, 128),
-                accent: Color::Rgb(185, 28, 28),
-                danger: Color::Rgb(153, 27, 27),
-                ok: Color::Rgb(21, 128, 61),
-            },
-            Self::Matrix => Palette {
-                bg: Color::Rgb(4, 16, 10),
-                panel: Color::Rgb(8, 28, 16),
-                text: Color::Rgb(166, 255, 181),
-                muted: Color::Rgb(69, 140, 83),
-                accent: Color::Rgb(52, 211, 153),
-                danger: Color::Rgb(248, 113, 113),
-                ok: Color::Rgb(134, 239, 172),
-            },
-        }
-    }
-
-    fn tag_color_choices(self) -> &'static [TagColorChoice] {
-        &TAG_COLOR_CHOICES
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeymapPreset {
-    Default,
-    Vim,
-}
-
-impl KeymapPreset {
-    fn next(self) -> Self {
-        match self {
-            Self::Default => Self::Vim,
-            Self::Vim => Self::Default,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Vim => "vim",
-        }
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        match label.trim().to_ascii_lowercase().as_str() {
-            "default" => Some(Self::Default),
-            "vim" => Some(Self::Vim),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Density {
-    Cozy,
-    Compact,
-}
-
-impl Density {
-    fn toggle(self) -> Self {
-        match self {
-            Self::Cozy => Self::Compact,
-            Self::Compact => Self::Cozy,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Cozy => "cozy",
-            Self::Compact => "compact",
-        }
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        match label.trim().to_ascii_lowercase().as_str() {
-            "cozy" => Some(Self::Cozy),
-            "compact" => Some(Self::Compact),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortMode {
-    Manual,
-    Updated,
-    Title,
-}
-
-impl SortMode {
-    fn next(self) -> Self {
-        match self {
-            Self::Manual => Self::Updated,
-            Self::Updated => Self::Title,
-            Self::Title => Self::Manual,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Manual => "manual",
-            Self::Updated => "updated",
-            Self::Title => "title",
-        }
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        match label.trim().to_ascii_lowercase().as_str() {
-            "manual" => Some(Self::Manual),
-            "updated" | "recent" => Some(Self::Updated),
-            "title" | "alpha" | "alphabetical" => Some(Self::Title),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Palette {
-    bg: Color,
-    panel: Color,
-    text: Color,
-    muted: Color,
-    accent: Color,
-    danger: Color,
-    ok: Color,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TagColorChoice {
-    key: &'static str,
-    label: &'static str,
-    neo: (Color, Color),
-    paper: (Color, Color),
-    matrix: (Color, Color),
-}
-
-impl TagColorChoice {
-    fn colors(self, theme: ThemeName) -> (Color, Color) {
-        match theme {
-            ThemeName::NeoNoir => self.neo,
-            ThemeName::Paper => self.paper,
-            ThemeName::Matrix => self.matrix,
-        }
-    }
-}
-
-const TAG_COLOR_CHOICES: [TagColorChoice; 8] = [
-    TagColorChoice {
-        key: "sky",
-        label: "Sky",
-        neo: (Color::Rgb(56, 189, 248), Color::Rgb(12, 14, 18)),
-        paper: (Color::Rgb(29, 78, 216), Color::Rgb(246, 242, 230)),
-        matrix: (Color::Rgb(34, 211, 238), Color::Rgb(4, 16, 10)),
-    },
-    TagColorChoice {
-        key: "violet",
-        label: "Violet",
-        neo: (Color::Rgb(167, 139, 250), Color::Rgb(12, 14, 18)),
-        paper: (Color::Rgb(126, 34, 206), Color::Rgb(246, 242, 230)),
-        matrix: (Color::Rgb(167, 139, 250), Color::Rgb(4, 16, 10)),
-    },
-    TagColorChoice {
-        key: "green",
-        label: "Green",
-        neo: (Color::Rgb(74, 222, 128), Color::Rgb(12, 14, 18)),
-        paper: (Color::Rgb(21, 128, 61), Color::Rgb(246, 242, 230)),
-        matrix: (Color::Rgb(163, 230, 53), Color::Rgb(4, 16, 10)),
-    },
-    TagColorChoice {
-        key: "orange",
-        label: "Orange",
-        neo: (Color::Rgb(251, 146, 60), Color::Rgb(12, 14, 18)),
-        paper: (Color::Rgb(194, 65, 12), Color::Rgb(246, 242, 230)),
-        matrix: (Color::Rgb(96, 165, 250), Color::Rgb(4, 16, 10)),
-    },
-    TagColorChoice {
-        key: "pink",
-        label: "Pink",
-        neo: (Color::Rgb(244, 114, 182), Color::Rgb(12, 14, 18)),
-        paper: (Color::Rgb(190, 24, 93), Color::Rgb(246, 242, 230)),
-        matrix: (Color::Rgb(244, 114, 182), Color::Rgb(4, 16, 10)),
-    },
-    TagColorChoice {
-        key: "yellow",
-        label: "Yellow",
-        neo: (Color::Rgb(250, 204, 21), Color::Rgb(12, 14, 18)),
-        paper: (Color::Rgb(161, 98, 7), Color::Rgb(246, 242, 230)),
-        matrix: (Color::Rgb(250, 204, 21), Color::Rgb(4, 16, 10)),
-    },
-    TagColorChoice {
-        key: "teal",
-        label: "Teal",
-        neo: (Color::Rgb(45, 212, 191), Color::Rgb(12, 14, 18)),
-        paper: (Color::Rgb(15, 118, 110), Color::Rgb(246, 242, 230)),
-        matrix: (Color::Rgb(52, 211, 153), Color::Rgb(4, 16, 10)),
-    },
-    TagColorChoice {
-        key: "red",
-        label: "Red",
-        neo: (Color::Rgb(248, 113, 113), Color::Rgb(12, 14, 18)),
-        paper: (Color::Rgb(185, 28, 28), Color::Rgb(246, 242, 230)),
-        matrix: (Color::Rgb(248, 113, 113), Color::Rgb(4, 16, 10)),
-    },
-];
-
-#[derive(Debug, Clone, PartialEq)]
-struct EditorBuffer {
-    lines: Vec<String>,
-    cursor_row: usize,
-    cursor_col: usize,
-}
-
-impl EditorBuffer {
-    const TAB_WIDTH: usize = 4;
-
-    fn new() -> Self {
-        Self {
-            lines: vec![String::new()],
-            cursor_row: 0,
-            cursor_col: 0,
-        }
-    }
-
-    fn from_text(text: String) -> Self {
-        let mut lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
-        if text.ends_with('\n') {
-            lines.push(String::new());
-        }
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        Self {
-            lines,
-            cursor_row: 0,
-            cursor_col: 0,
-        }
-    }
-
-    fn to_text(&self) -> String {
-        self.lines.join("\n")
-    }
-
-    fn set_cursor_to_end(&mut self) {
-        self.cursor_row = self.lines.len().saturating_sub(1);
-        self.cursor_col = self.current_line_len();
-    }
-
-    fn insert_char(&mut self, c: char) {
-        let idx = self.byte_idx_at_cursor();
-        self.lines[self.cursor_row].insert(idx, c);
-        self.cursor_col += 1;
-    }
-
-    fn insert_str(&mut self, s: &str) {
-        for c in s.chars() {
-            match c {
-                '\n' => self.insert_newline(),
-                '\r' => {} // skip CR from CRLF clipboard content
-                c => self.insert_char(c),
-            }
-        }
-    }
-
-    fn insert_pasted_str(&mut self, s: &str) {
-        let normalized = normalize_pasted_text(s, self.cursor_col, Self::TAB_WIDTH);
-        self.insert_str(&normalized);
-    }
-
-    fn insert_newline(&mut self) {
-        let idx = self.byte_idx_at_cursor();
-        let tail = self.lines[self.cursor_row].split_off(idx);
-        self.cursor_row += 1;
-        self.cursor_col = 0;
-        self.lines.insert(self.cursor_row, tail);
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor_col > 0 {
-            let start = byte_idx_from_char_idx(&self.lines[self.cursor_row], self.cursor_col - 1);
-            let end = byte_idx_from_char_idx(&self.lines[self.cursor_row], self.cursor_col);
-            self.lines[self.cursor_row].replace_range(start..end, "");
-            self.cursor_col -= 1;
-            return;
-        }
-
-        if self.cursor_row > 0 {
-            let current = self.lines.remove(self.cursor_row);
-            self.cursor_row -= 1;
-            self.cursor_col = self.current_line_len();
-            self.lines[self.cursor_row].push_str(&current);
-        }
-    }
-
-    fn delete(&mut self) {
-        let line_len = self.current_line_len();
-        if self.cursor_col < line_len {
-            let start = byte_idx_from_char_idx(&self.lines[self.cursor_row], self.cursor_col);
-            let end = byte_idx_from_char_idx(&self.lines[self.cursor_row], self.cursor_col + 1);
-            self.lines[self.cursor_row].replace_range(start..end, "");
-            return;
-        }
-
-        if self.cursor_row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.cursor_row + 1);
-            self.lines[self.cursor_row].push_str(&next);
-        }
-    }
-
-    fn move_left(&mut self) {
-        if self.cursor_col > 0 {
-            self.cursor_col -= 1;
-        } else if self.cursor_row > 0 {
-            self.cursor_row -= 1;
-            self.cursor_col = self.current_line_len();
-        }
-    }
-
-    fn move_right(&mut self) {
-        if self.cursor_col < self.current_line_len() {
-            self.cursor_col += 1;
-        } else if self.cursor_row + 1 < self.lines.len() {
-            self.cursor_row += 1;
-            self.cursor_col = 0;
-        }
-    }
-
-    fn move_up(&mut self) {
-        if self.cursor_row > 0 {
-            self.cursor_row -= 1;
-            self.cursor_col = self.cursor_col.min(self.current_line_len());
-        }
-    }
-
-    fn move_down(&mut self) {
-        if self.cursor_row + 1 < self.lines.len() {
-            self.cursor_row += 1;
-            self.cursor_col = self.cursor_col.min(self.current_line_len());
-        }
-    }
-
-    fn move_home(&mut self) {
-        self.cursor_col = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor_col = self.current_line_len();
-    }
-
-    fn current_line_len(&self) -> usize {
-        self.lines[self.cursor_row].chars().count()
-    }
-
-    fn byte_idx_at_cursor(&self) -> usize {
-        byte_idx_from_char_idx(&self.lines[self.cursor_row], self.cursor_col)
-    }
-
-    fn is_word_char(c: char) -> bool {
-        c.is_alphanumeric() || c == '_'
-    }
-
-    fn move_word_left(&mut self) {
-        if self.cursor_col == 0 {
-            if self.cursor_row > 0 {
-                self.cursor_row -= 1;
-                self.cursor_col = self.current_line_len();
-            }
-            return;
-        }
-        let line: Vec<char> = self.lines[self.cursor_row].chars().collect();
-        let mut col = self.cursor_col;
-        // skip whitespace/non-word to the left
-        while col > 0 && !Self::is_word_char(line[col - 1]) {
-            col -= 1;
-        }
-        // skip word chars to the left
-        while col > 0 && Self::is_word_char(line[col - 1]) {
-            col -= 1;
-        }
-        self.cursor_col = col;
-    }
-
-    fn open_line_above(&mut self) {
-        self.lines.insert(self.cursor_row, String::new());
-        self.cursor_col = 0;
-    }
-
-    fn move_word_right(&mut self) {
-        let line_len = self.current_line_len();
-        if self.cursor_col >= line_len {
-            if self.cursor_row + 1 < self.lines.len() {
-                self.cursor_row += 1;
-                self.cursor_col = 0;
-            }
-            return;
-        }
-        let line: Vec<char> = self.lines[self.cursor_row].chars().collect();
-        let mut col = self.cursor_col;
-        // skip word chars to the right
-        while col < line_len && Self::is_word_char(line[col]) {
-            col += 1;
-        }
-        // skip whitespace/non-word to the right
-        while col < line_len && !Self::is_word_char(line[col]) {
-            col += 1;
-        }
-        self.cursor_col = col;
-    }
-}
-
-fn byte_idx_from_char_idx(s: &str, char_idx: usize) -> usize {
-    if char_idx == 0 {
-        return 0;
-    }
-
-    let len = s.chars().count();
-    if char_idx >= len {
-        return s.len();
-    }
-
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(idx, _)| idx)
-        .unwrap_or(s.len())
-}
-
-fn normalize_pasted_text(text: &str, start_col: usize, tab_width: usize) -> String {
-    let mut normalized = String::with_capacity(text.len());
-    let mut col = start_col;
-
-    for ch in text.chars() {
-        match ch {
-            '\r' => {}
-            '\n' => {
-                normalized.push('\n');
-                col = 0;
-            }
-            '\t' => {
-                let spaces = tab_width - (col % tab_width);
-                for _ in 0..spaces {
-                    normalized.push(' ');
-                }
-                col += spaces;
-            }
-            _ => {
-                normalized.push(ch);
-                col += 1;
-            }
-        }
-    }
-
-    normalized
-}
 
 fn is_ctrl_char(key: &KeyEvent, c: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
@@ -618,6 +80,9 @@ pub struct App {
     switcher_input: String,
     switcher_cursor: usize,
     switcher_results: Vec<NoteSummary>,
+    palette_input: String,
+    palette_cursor: usize,
+    palette_results: Vec<usize>,
     note_browser_input: String,
     note_browser_cursor: usize,
     note_browser_results: Vec<NoteSummary>,
@@ -686,6 +151,9 @@ impl App {
             switcher_input: String::new(),
             switcher_cursor: 0,
             switcher_results: Vec::new(),
+            palette_input: String::new(),
+            palette_cursor: 0,
+            palette_results: (0..command_palette_entries().len()).collect(),
             note_browser_input: String::new(),
             note_browser_cursor: 0,
             note_browser_results: Vec::new(),
@@ -755,6 +223,27 @@ impl App {
         Ok(())
     }
 
+    /// Open today's daily note, creating it with a template if it doesn't exist.
+    pub fn open_daily_note(&mut self) -> Result<()> {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let existing = self.store.find_note_by_title(&today)?;
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                let body = format!("# {}\n\n## Tasks\n\n## Notes\n", today);
+                self.store.create_note_with_title_lock(&today, &body, true)?
+            }
+        };
+        self.store.restore_note(id)?;
+        self.store.set_archived(id, false)?;
+        self.refresh_notes()?;
+        self.select_by_id(id);
+        self.sync_active_note_from_cursor()?;
+        self.enter_edit_mode();
+        self.status = format!("Daily note: {}", today);
+        Ok(())
+    }
+
     pub fn run(mut self) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
@@ -791,25 +280,21 @@ impl App {
                 }
             }
 
-            if self.dirty {
-                if let Some(t) = self.last_edit {
-                    if t.elapsed() >= Duration::from_secs(AUTO_SAVE_SECS) {
-                        let _ = self.save_active_note();
-                        // For vim mode, restore edtui cursor/mode after save since
-                        // save_active_note may reorder the note list but leaves editor_state
-                        // cursor unclamped. Default mode uses editor_buffer directly — no sync needed.
-                        if self.keymap == KeymapPreset::Vim {
-                            let row = self.editor_state.cursor.row
-                                .min(self.editor_buffer.lines.len().saturating_sub(1));
-                            let col = self.editor_state.cursor.col
-                                .min(self.editor_buffer.current_line_len());
-                            self.editor_state.cursor.row = row;
-                            self.editor_state.cursor.col = col;
-                        }
-                        self.last_edit = None;
-                        self.status = "Saved".to_string();
-                    }
+            if self.dirty
+                && let Some(t) = self.last_edit
+                && t.elapsed() >= Duration::from_secs(AUTO_SAVE_SECS)
+            {
+                let _ = self.save_active_note();
+                if self.keymap == KeymapPreset::Vim {
+                    let row = self.editor_state.cursor.row
+                        .min(self.editor_buffer.lines.len().saturating_sub(1));
+                    let col = self.editor_state.cursor.col
+                        .min(self.editor_buffer.current_line_len());
+                    self.editor_state.cursor.row = row;
+                    self.editor_state.cursor.col = col;
                 }
+                self.last_edit = None;
+                self.status = "Saved".to_string();
             }
         }
     }
@@ -886,6 +371,7 @@ impl App {
             Mode::Command => self.handle_command_key(key),
             Mode::Find => self.handle_find_key(key),
             Mode::Switcher => self.handle_switcher_key(key),
+            Mode::CommandPalette => self.handle_command_palette_key(key),
             Mode::ArchiveBrowser => self.handle_archive_browser_key(key),
             Mode::TrashBrowser => self.handle_trash_browser_key(key),
             Mode::Tags => self.handle_tags_key(key),
@@ -977,7 +463,7 @@ impl App {
             KeymapPreset::Vim => self.editor_state.mode,
         };
         self.editor_state = state;
-    }
+}
 
     fn sync_editor_buffer_from_state(&mut self) {
         self.editor_buffer = EditorBuffer::from_text(self.editor_state.lines.to_string());
@@ -1127,16 +613,15 @@ impl App {
         let active_id = self.active_note_id;
         self.refresh_notes()?;
 
-        if let Some(id) = active_id {
-            if let Some(pos) = self
+        if let Some(id) = active_id
+            && let Some(pos) = self
                 .tree
                 .iter()
                 .position(|item| item.note().map(|n| n.id == id).unwrap_or(false))
-            {
-                self.tree_cursor = pos;
-                self.sync_active_note_from_cursor()?;
-                return Ok(());
-            }
+        {
+            self.tree_cursor = pos;
+            self.sync_active_note_from_cursor()?;
+            return Ok(());
         }
 
         self.restore_search_cursor(0)
@@ -1149,6 +634,73 @@ impl App {
         self.mode = Mode::Switcher;
         self.status = "Switcher: type to jump to a note".to_string();
         Ok(())
+    }
+
+    fn open_command_palette(&mut self) -> Result<()> {
+        self.palette_input.clear();
+        self.palette_cursor = 0;
+        self.refresh_palette_results();
+        self.mode = Mode::CommandPalette;
+        self.status = "Command palette: type to filter".to_string();
+        Ok(())
+    }
+
+    fn refresh_palette_results(&mut self) {
+        let entries = command_palette_entries();
+        let query = self.palette_input.trim().to_ascii_lowercase();
+        let mut indices: Vec<usize> = (0..entries.len()).filter(|&i| {
+            let e = &entries[i];
+            query.is_empty()
+                || e.name.to_ascii_lowercase().contains(&query)
+                || e.description.to_ascii_lowercase().contains(&query)
+        }).collect();
+        if !query.is_empty() {
+            indices.sort_by(|&a, &b| {
+                let rank = |i: usize| -> u8 {
+                    let name = entries[i].name.to_ascii_lowercase();
+                    if name == query { 0 }
+                    else if name.starts_with(&query) { 1 }
+                    else { 2 }
+                };
+                rank(a).cmp(&rank(b))
+            });
+        }
+        self.palette_results = indices;
+        if self.palette_cursor >= self.palette_results.len() {
+            self.palette_cursor = self.palette_results.len().saturating_sub(1);
+        }
+    }
+
+    fn execute_palette_selection(&mut self) -> Result<bool> {
+        let Some(&idx) = self.palette_results.get(self.palette_cursor) else {
+            return Ok(false);
+        };
+        self.mode = Mode::Normal;
+        let entry = &command_palette_entries()[idx];
+        if entry.command == "create-folder" {
+            self.tree_inline_input.clear();
+            self.tree_inline_mode = TreeInlineMode::CreateFolder;
+            self.status = "New folder: type name, Enter to confirm".to_string();
+            return Ok(false);
+        }
+        if entry.command == "toggle-theme" {
+            self.theme = self.theme.next();
+            self.persist_preferences();
+            self.status = format!("Theme -> {}", self.theme.label());
+            return Ok(false);
+        }
+        if entry.command == "toggle-keymap" {
+            self.keymap = self.keymap.next();
+            self.apply_editor_keymap();
+            self.persist_preferences();
+            self.status = format!("Keymap -> {}", self.keymap.label());
+            return Ok(false);
+        }
+        if entry.command == "toggle-sort" {
+            self.set_sort_mode(self.sort_mode.next())?;
+            return Ok(false);
+        }
+        self.execute_command(entry.command)
     }
 
     fn refresh_switcher_results(&mut self) -> Result<()> {
@@ -1535,8 +1087,18 @@ impl App {
         }
 
         if is_ctrl_char(&key, 'p') {
+            self.open_command_palette()?;
+            return Ok(false);
+        }
+
+        if is_ctrl_char(&key, 'o') {
             self.quit_pending = false;
             self.open_switcher()?;
+            return Ok(false);
+        }
+
+        if is_ctrl_char(&key, 'd') {
+            self.open_daily_note()?;
             return Ok(false);
         }
 
@@ -1604,32 +1166,25 @@ impl App {
         // Left/Right: expand/collapse folders
         match key.code {
             KeyCode::Right => {
-                match self.tree.get(self.tree_cursor).cloned() {
-                    Some(TreeItem::Folder { name, expanded, .. }) => {
-                        if !expanded {
-                            // Expand the folder
-                            self.toggle_folder(&name, false)?;
-                        } else {
-                            // Already expanded: move into first child note
-                            let next = self.tree_cursor + 1;
-                            if next < self.tree.len() {
-                                if let Some(TreeItem::Note(_)) = self.tree.get(next) {
-                                    self.tree_cursor = next;
-                                    self.sync_active_note_from_cursor()?;
-                                }
-                            }
+                if let Some(TreeItem::Folder { name, expanded, .. }) = self.tree.get(self.tree_cursor).cloned() {
+                    if !expanded {
+                        self.toggle_folder(&name, false)?;
+                    } else {
+                        let next = self.tree_cursor + 1;
+                        if next < self.tree.len()
+                            && let Some(TreeItem::Note(_)) = self.tree.get(next)
+                        {
+                            self.tree_cursor = next;
+                            self.sync_active_note_from_cursor()?;
                         }
                     }
-                    _ => {}
                 }
                 return Ok(false);
             }
             KeyCode::Left => {
                 match self.tree.get(self.tree_cursor).cloned() {
-                    Some(TreeItem::Folder { name, expanded, .. }) => {
-                        if expanded {
-                            self.toggle_folder(&name, true)?;
-                        }
+                    Some(TreeItem::Folder { name, expanded, .. }) if expanded => {
+                        self.toggle_folder(&name, true)?;
                     }
                     Some(TreeItem::Note(note)) if !note.folder.is_empty() => {
                         // Collapse parent folder and land on it
@@ -1694,20 +1249,20 @@ impl App {
                 self.enter_edit_mode();
                 self.status = "Created note".to_string();
             }
-            KeyCode::Char('p') => {
+            KeyCode::Char('s') => {
                 if !self.selected_note_ids_in_view().is_empty() {
                     for id in self.selected_note_ids_in_view() {
                         self.store.set_pinned(id, true)?;
                     }
                     self.refresh_notes()?;
-                    self.status = "Pinned selected notes".to_string();
+                    self.status = "Stickied selected notes".to_string();
                 } else if let Some(id) = self.active_note_id {
                     let pinned = self.active_summary().map(|note| note.pinned).unwrap_or(false);
                     self.store.set_pinned(id, !pinned)?;
                     self.refresh_notes()?;
                     self.select_by_id(id);
                     self.sync_active_note_from_cursor()?;
-                    self.status = if pinned { "Note unpinned".to_string() } else { "Note pinned".to_string() };
+                    self.status = if pinned { "Note unstickied".to_string() } else { "Note stickied".to_string() };
                 }
             }
             KeyCode::Char('a') => {
@@ -1758,16 +1313,16 @@ impl App {
                 self.status = "Use the trash browser (T) to purge notes".to_string();
             }
             KeyCode::Char('e') | KeyCode::Enter => {
-                match self.tree.get(self.tree_cursor).cloned() {
-                    Some(TreeItem::Folder { name, expanded, .. }) => {
-                        self.toggle_folder(&name, expanded)?;
-                    }
-                    Some(TreeItem::Note(_)) => {
-                        if self.active_note_id.is_some() {
+                if let Some(item) = self.tree.get(self.tree_cursor).cloned() {
+                    match item {
+                        TreeItem::Folder { name, expanded, .. } => {
+                            self.toggle_folder(&name, expanded)?;
+                        }
+                        TreeItem::Note(_) if self.active_note_id.is_some() => {
                             self.enter_edit_mode();
                         }
+                        _ => {}
                     }
-                    None => {}
                 }
             }
             KeyCode::Char('/') => {
@@ -1854,7 +1409,17 @@ impl App {
 
     fn handle_edit_key(&mut self, key: KeyEvent) -> Result<bool> {
         if is_ctrl_char(&key, 'p') {
+            self.open_command_palette()?;
+            return Ok(false);
+        }
+
+        if is_ctrl_char(&key, 'o') {
             self.open_switcher()?;
+            return Ok(false);
+        }
+
+        if is_ctrl_char(&key, 'd') {
+            self.open_daily_note()?;
             return Ok(false);
         }
 
@@ -1898,7 +1463,7 @@ impl App {
                 if self.lints_active {
                     self.run_lints();
                 }
-            } else {
+} else {
                 self.push_undo();
                 self.delete_selection();
                 self.editor_buffer.insert_str("    ");
@@ -2243,10 +1808,10 @@ impl App {
             _ if self.normal_is_up(&key) => {
                 self.switcher_cursor = self.switcher_cursor.saturating_sub(1);
             }
-            _ if self.normal_is_down(&key) => {
-                if self.switcher_cursor + 1 < self.switcher_results.len() {
-                    self.switcher_cursor += 1;
-                }
+            _ if self.normal_is_down(&key)
+                && self.switcher_cursor + 1 < self.switcher_results.len() =>
+            {
+                self.switcher_cursor += 1;
             }
             KeyCode::Backspace => {
                 self.switcher_input.pop();
@@ -2264,6 +1829,39 @@ impl App {
         Ok(false)
     }
 
+    fn handle_command_palette_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status = "Command palette canceled".to_string();
+            }
+            KeyCode::Enter => {
+                return self.execute_palette_selection();
+            }
+            _ if self.normal_is_up(&key) => {
+                self.palette_cursor = self.palette_cursor.saturating_sub(1);
+            }
+            _ if self.normal_is_down(&key)
+                && self.palette_cursor + 1 < self.palette_results.len() =>
+            {
+                self.palette_cursor += 1;
+            }
+            KeyCode::Backspace => {
+                self.palette_input.pop();
+                self.refresh_palette_results();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.palette_input.push(c);
+                self.refresh_palette_results();
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
     fn handle_archive_browser_key(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('A') => {
@@ -2273,11 +1871,11 @@ impl App {
                 self.note_browser_cursor = self.note_browser_cursor.saturating_sub(1);
                 self.sync_preview_from_note_browser_cursor()?;
             }
-            _ if self.normal_is_down(&key) => {
-                if self.note_browser_cursor + 1 < self.note_browser_results.len() {
-                    self.note_browser_cursor += 1;
-                    self.sync_preview_from_note_browser_cursor()?;
-                }
+            _ if self.normal_is_down(&key)
+                && self.note_browser_cursor + 1 < self.note_browser_results.len() =>
+            {
+                self.note_browser_cursor += 1;
+                self.sync_preview_from_note_browser_cursor()?;
             }
             KeyCode::Backspace => {
                 self.note_browser_input.pop();
@@ -2336,11 +1934,11 @@ impl App {
                 self.note_browser_cursor = self.note_browser_cursor.saturating_sub(1);
                 self.sync_preview_from_note_browser_cursor()?;
             }
-            _ if self.normal_is_down(&key) => {
-                if self.note_browser_cursor + 1 < self.note_browser_results.len() {
-                    self.note_browser_cursor += 1;
-                    self.sync_preview_from_note_browser_cursor()?;
-                }
+            _ if self.normal_is_down(&key)
+                && self.note_browser_cursor + 1 < self.note_browser_results.len() =>
+            {
+                self.note_browser_cursor += 1;
+                self.sync_preview_from_note_browser_cursor()?;
             }
             KeyCode::Backspace => {
                 self.note_browser_input.pop();
@@ -2400,10 +1998,10 @@ impl App {
                 _ if self.normal_is_up(&key) => {
                     self.tag_browser_cursor = self.tag_browser_cursor.saturating_sub(1);
                 }
-                _ if self.normal_is_down(&key) => {
-                    if self.tag_browser_cursor + 1 < self.tag_browser_entries.len() {
-                        self.tag_browser_cursor += 1;
-                    }
+                _ if self.normal_is_down(&key)
+                    && self.tag_browser_cursor + 1 < self.tag_browser_entries.len() =>
+                {
+                    self.tag_browser_cursor += 1;
                 }
                 KeyCode::Char('n') => {
                     self.tag_browser_mode = TagBrowserMode::Create;
@@ -2574,23 +2172,23 @@ impl App {
                     self.mode = Mode::Edit;
                     self.status = "Edit mode".to_string();
                 }
-                KeyCode::Down | KeyCode::Char('n') => {
-                    if !self.find_matches.is_empty() {
-                        self.find_cursor = (self.find_cursor + 1) % self.find_matches.len();
-                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
-                        self.update_find_status();
-                    }
+                KeyCode::Down | KeyCode::Char('n')
+                    if !self.find_matches.is_empty() =>
+                {
+                    self.find_cursor = (self.find_cursor + 1) % self.find_matches.len();
+                    self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                    self.update_find_status();
                 }
-                KeyCode::Up | KeyCode::Char('N') => {
-                    if !self.find_matches.is_empty() {
-                        self.find_cursor = if self.find_cursor == 0 {
-                            self.find_matches.len() - 1
-                        } else {
-                            self.find_cursor - 1
-                        };
-                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
-                        self.update_find_status();
-                    }
+                KeyCode::Up | KeyCode::Char('N')
+                    if !self.find_matches.is_empty() =>
+                {
+                    self.find_cursor = if self.find_cursor == 0 {
+                        self.find_matches.len() - 1
+                    } else {
+                        self.find_cursor - 1
+                    };
+                    self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                    self.update_find_status();
                 }
                 KeyCode::Backspace => {
                     // Drop back to typing phase
@@ -2613,30 +2211,30 @@ impl App {
         } else {
             // Typing phase
             match key.code {
-                KeyCode::Enter | KeyCode::Tab => {
-                    if !self.find_matches.is_empty() {
-                        self.find_committed = true;
-                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
-                        self.update_find_status();
-                    }
+                KeyCode::Enter | KeyCode::Tab
+                    if !self.find_matches.is_empty() =>
+                {
+                    self.find_committed = true;
+                    self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                    self.update_find_status();
                 }
-                KeyCode::Down => {
-                    if !self.find_matches.is_empty() {
-                        self.find_cursor = (self.find_cursor + 1) % self.find_matches.len();
-                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
-                        self.update_find_status();
-                    }
+                KeyCode::Down
+                    if !self.find_matches.is_empty() =>
+                {
+                    self.find_cursor = (self.find_cursor + 1) % self.find_matches.len();
+                    self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                    self.update_find_status();
                 }
-                KeyCode::Up => {
-                    if !self.find_matches.is_empty() {
-                        self.find_cursor = if self.find_cursor == 0 {
-                            self.find_matches.len() - 1
-                        } else {
-                            self.find_cursor - 1
-                        };
-                        self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
-                        self.update_find_status();
-                    }
+                KeyCode::Up
+                    if !self.find_matches.is_empty() =>
+                {
+                    self.find_cursor = if self.find_cursor == 0 {
+                        self.find_matches.len() - 1
+                    } else {
+                        self.find_cursor - 1
+                    };
+                    self.jump_to_flat_offset(self.find_matches[self.find_cursor]);
+                    self.update_find_status();
                 }
                 KeyCode::Backspace => {
                     self.find_query.pop();
@@ -2706,10 +2304,7 @@ impl App {
                 .find_matches
                 .iter()
                 .enumerate()
-                .min_by_key(|&(_, &off)| {
-                    let d = if off >= cur { off - cur } else { cur - off };
-                    d
-                })
+                .min_by_key(|&(_, &off)| off.abs_diff(cur))
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             self.find_cursor = nearest;
@@ -2868,7 +2463,7 @@ impl App {
                     self.status = format!("Keymap -> {}", keymap.label());
                 } else {
                     self.status = "Usage: :keymap default|vim".to_string();
-                }
+}
             }
             "sort" => {
                 let arg = parts.next().unwrap_or("");
@@ -2908,6 +2503,16 @@ impl App {
                     self.status = "No active note".to_string();
                 }
             }
+            "delete" => {
+                if let Some(id) = self.active_note_id {
+                    self.store.delete_note(id)?;
+                    self.refresh_notes()?;
+                    self.sync_active_note_from_cursor()?;
+                    self.status = "Note deleted".to_string();
+                } else {
+                    self.status = "No active note".to_string();
+                }
+            }
             "empty-trash" => {
                 let count = self.store.purge_deleted_notes()?;
                 self.refresh_notes()?;
@@ -2939,7 +2544,7 @@ impl App {
                     self.store.set_pinned(id, true)?;
                     self.refresh_notes()?;
                     self.select_by_id(id);
-                    self.status = "Note pinned".to_string();
+                    self.status = "Note stickied".to_string();
                 } else {
                     self.status = "No active note".to_string();
                 }
@@ -2949,7 +2554,7 @@ impl App {
                     self.store.set_pinned(id, false)?;
                     self.refresh_notes()?;
                     self.select_by_id(id);
-                    self.status = "Note unpinned".to_string();
+                    self.status = "Note unstickied".to_string();
                 } else {
                     self.status = "No active note".to_string();
                 }
@@ -3073,6 +2678,9 @@ impl App {
                 } else {
                     self.status = "No active note".to_string();
                 }
+            }
+            "daily" => {
+                self.open_daily_note()?;
             }
             "help" => {
                 self.mode = Mode::Help;
@@ -3464,10 +3072,10 @@ impl App {
     }
 
     fn clipboard_set(&mut self, text: &str) {
-        if let Some(cb) = self.clipboard.as_mut() {
-            if cb.set_text(text).is_ok() {
-                return;
-            }
+        if let Some(cb) = self.clipboard.as_mut()
+            && cb.set_text(text).is_ok()
+        {
+            return;
         }
         // Fallback: shell clipboard tools
         let _ = std::process::Command::new("wl-copy")
@@ -3494,26 +3102,23 @@ impl App {
             return Some(text);
         }
         // Fallback: shell clipboard tools
-        if let Ok(out) = std::process::Command::new("wl-paste").arg("--no-newline").output() {
-            if out.status.success() {
-                if let Ok(s) = String::from_utf8(out.stdout) {
-                    return Some(s);
-                }
-            }
+        if let Ok(out) = std::process::Command::new("wl-paste").arg("--no-newline").output()
+            && out.status.success()
+            && let Ok(s) = String::from_utf8(out.stdout)
+        {
+            return Some(s);
         }
-        if let Ok(out) = std::process::Command::new("xclip").args(["-sel", "clip", "-o"]).output() {
-            if out.status.success() {
-                if let Ok(s) = String::from_utf8(out.stdout) {
-                    return Some(s);
-                }
-            }
+        if let Ok(out) = std::process::Command::new("xclip").args(["-sel", "clip", "-o"]).output()
+            && out.status.success()
+            && let Ok(s) = String::from_utf8(out.stdout)
+        {
+            return Some(s);
         }
-        if let Ok(out) = std::process::Command::new("xsel").arg("--clipboard").arg("--output").output() {
-            if out.status.success() {
-                if let Ok(s) = String::from_utf8(out.stdout) {
-                    return Some(s);
-                }
-            }
+        if let Ok(out) = std::process::Command::new("xsel").arg("--clipboard").arg("--output").output()
+            && out.status.success()
+            && let Ok(s) = String::from_utf8(out.stdout)
+        {
+            return Some(s);
         }
         None
     }
@@ -3858,7 +3463,7 @@ impl App {
             if let Some(a) = anchor {
                 let sel_start = a.min(cursor);
                 let sel_end = a.max(cursor);
-                if sel_start < sel_end {
+if sel_start < sel_end {
                     let text = self.editor_buffer.to_text();
                     let (sr, sc) = Self::char_offset_to_pos(&text, sel_start);
                     let (er, ec) = Self::char_offset_to_pos(&text, sel_end);
@@ -3880,6 +3485,7 @@ impl App {
         let find_active_style = Style::default().bg(palette.ok).fg(palette.bg).add_modifier(Modifier::BOLD);
 
         // Pre-compute find match row/col positions
+        #[allow(clippy::type_complexity)]
         let (find_positions, find_active_pos): (Vec<(usize, usize, usize)>, Option<(usize, usize, usize)>) =
             if !self.find_matches.is_empty() {
                 let text = self.editor_buffer.to_text();
@@ -3922,7 +3528,7 @@ impl App {
             };
 
             // Number of visual sub-lines for content (empty line = 1 visual row)
-            let content_sub_lines = if len == 0 { 1 } else { (len + width - 1) / width };
+            let content_sub_lines = if len == 0 { 1 } else { len.div_ceil(width) };
             // Ensure enough sub-lines to accommodate the cursor position
             let sub_lines = if is_cursor_row {
                 content_sub_lines.max(cursor_sub_row + 1)
@@ -4380,6 +3986,7 @@ impl App {
             Mode::Command => " Preview ",
             Mode::Find => " Edit (find) ",
             Mode::Switcher => " Preview ",
+            Mode::CommandPalette => " Preview ",
             Mode::ArchiveBrowser => " Preview ",
             Mode::TrashBrowser => " Preview ",
             Mode::Tags => " Preview ",
@@ -4462,19 +4069,11 @@ impl App {
             frame.set_cursor_position((cursor_x, cursor_y));
         }
 
-        if self.mode == Mode::Edit {
-            if let Some(idx) = self.lint_index_at_cursor() {
-                if let Some(lint) = self.lints.get(idx) {
-                    self.render_lint_popup(
-                        frame,
-                        editor_layout[1],
-                        cursor_x,
-                        cursor_y,
-                        lint,
-                        palette,
-                    );
-                }
-            }
+        if self.mode == Mode::Edit
+            && let Some(idx) = self.lint_index_at_cursor()
+            && let Some(lint) = self.lints.get(idx)
+        {
+            self.render_lint_popup(frame, editor_layout[1], cursor_x, cursor_y, lint, palette);
         }
 
         let mode_text = match self.mode {
@@ -4484,6 +4083,7 @@ impl App {
             Mode::Command => "COMMAND",
             Mode::Find => "FIND",
             Mode::Switcher => "SWITCH",
+            Mode::CommandPalette => "PALETTE",
             Mode::ArchiveBrowser => "ARCHIVE",
             Mode::TrashBrowser => "TRASH",
             Mode::Tags => "TAGS",
@@ -4509,6 +4109,11 @@ impl App {
             Mode::Switcher => fit_footer_segments(
                 &format!("jump:{}", self.switcher_input),
                 &["j/k move", "Enter open", "Bksp edit", "Esc close"],
+                footer_width,
+            ),
+            Mode::CommandPalette => fit_footer_segments(
+                &format!("cmd:{}", self.palette_input),
+                &["j/k move", "Enter exec", "Bksp edit", "Esc close"],
                 footer_width,
             ),
             Mode::ArchiveBrowser => fit_footer_segments(
@@ -4570,7 +4175,7 @@ impl App {
                     } else if self.delete_pending {
                         vec!["d confirm", "any key cancel"]
                     } else if selected_count > 0 {
-                        vec!["a archive", "D trash", "p pin", "u clear"]
+                        vec!["a archive", "D trash", "s sticky", "u clear"]
                     } else if self.notes_pane_collapsed {
                         vec!["j/k scroll", "PgUp/PgDn", "\\ notes", "F9 sort", "? help", "q quit"]
                     } else {
@@ -4603,6 +4208,10 @@ impl App {
 
         if self.mode == Mode::Switcher {
             self.render_switcher_overlay(frame, palette);
+        }
+
+        if self.mode == Mode::CommandPalette {
+            self.render_command_palette_overlay(frame, palette);
         }
 
         if matches!(self.mode, Mode::ArchiveBrowser | Mode::TrashBrowser) {
@@ -4730,6 +4339,81 @@ impl App {
         );
     }
 
+    fn render_command_palette_overlay(&mut self, frame: &mut Frame, palette: Palette) {
+        let area = frame.area();
+        let w = area.width.min(56);
+        let h = area.height.min(20);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let popup = Rect { x, y, width: w, height: h };
+        let inner = Block::default()
+            .title(" Command Palette ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.accent))
+            .style(Style::default().bg(palette.bg).fg(palette.text))
+            .inner(popup);
+
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Block::default()
+                .title(" Command Palette ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette.accent))
+                .style(Style::default().bg(palette.bg).fg(palette.text)),
+            popup,
+        );
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(format!("> {}", self.palette_input))
+                .style(Style::default().fg(palette.accent).bg(palette.bg)),
+            chunks[0],
+        );
+
+        let items: Vec<ListItem> = if self.palette_results.is_empty() {
+            vec![ListItem::new(Line::styled(
+                "No matching commands",
+                Style::default().fg(palette.muted),
+            ))]
+        } else {
+            let entries = command_palette_entries();
+            self.palette_results
+                .iter()
+                .enumerate()
+                .map(|(idx, &ei)| {
+                    let entry = &entries[ei];
+                    let selected = idx == self.palette_cursor;
+                    let name_style = if selected {
+                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.text)
+                    };
+                    let desc_style = if selected {
+                        Style::default().fg(palette.text)
+                    } else {
+                        Style::default().fg(palette.muted)
+                    };
+                    ListItem::new(Line::from(vec![
+                        TSpan::styled(if selected { "▍ " } else { "  " }, name_style),
+                        TSpan::styled(entry.name, name_style),
+                        TSpan::styled(format!(" — {}", entry.description), desc_style),
+                    ]))
+                })
+                .collect()
+        };
+        let mut list_state = ratatui::widgets::ListState::default();
+        list_state.select(Some(self.palette_cursor.min(items.len().saturating_sub(1))));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(Style::default()),
+            chunks[1],
+            &mut list_state,
+        );
+    }
+
     fn render_note_browser_overlay(&mut self, frame: &mut Frame, palette: Palette) {
         let area = frame.area();
         let w = area.width.min(72);
@@ -4779,7 +4463,7 @@ impl App {
                     let selected = idx == self.note_browser_cursor;
                     let marked = self.note_browser_selected_ids.contains(&note.id);
                     let rail_style = if selected {
-                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
+Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(palette.bg)
                     };
@@ -5105,12 +4789,13 @@ impl App {
             row("d d",             "delete  (any other key cancels)"),
             row("Shift+↑↓",        "move note/folder"),
             row("/",               "search notes"),
-            row(":",               "command palette"),
+            row(":",               "command line"),
             row("\\",              "toggle notes pane"),
-            row("Ctrl+P",          "quick switcher"),
+            row("Ctrl+P",          "command palette"),
+            row("Ctrl+O",          "quick switcher"),
             row("g",               "browse and manage tags"),
             row("x / * / u",       "mark / all / clear"),
-            row("p",               "pin selected notes or toggle current note"),
+            row("s",               "sticky selected notes or toggle current note"),
             row("A / T",           "open archive / trash browser"),
             row("F9",              "cycle sort"),
             row("q",               "quit"),
@@ -5184,7 +4869,7 @@ impl App {
             row(":folder <name>",  "move to folder (empty = root)"),
             row(":unfolder",       "remove from folder (move to root)"),
             row(":tag / :untag",   "add/remove #tag on first line"),
-            row(":pin / :unpin",   "pin to top"),
+            row(":pin / :unpin",   "sticky to top"),
             row(":discard",        "discard unsaved changes"),
             row(":search <q>",     "search"),
             row(":reload",         "refresh list from disk"),
@@ -5192,7 +4877,6 @@ impl App {
             row(":keymap <name>",  "default|vim"),
             row(":sort <mode>",    "manual|updated|title"),
             row(":tags",           "browse and manage tags"),
-            row(":archived",       "open archive browser"),
             pad(),
             Line::from(vec![dim("  F6 theme  F7 keymap  F8 density  F9 sort  "), key("?/Esc"), dim(" close")]),
             pad(),
@@ -5219,825 +4903,10 @@ impl App {
     }
 }
 
-fn fit_footer_left(text: &str, width: usize) -> String {
-    truncate_with_ellipsis(text, width)
-}
-
-fn fit_footer_segments(left: &str, hints: &[&str], width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-
-    let left = truncate_with_ellipsis(left.trim(), width);
-    let left_len = left.chars().count();
-    if left_len >= width || hints.is_empty() {
-        return left;
-    }
-
-    let mut line = left;
-    for hint in hints {
-        let segment = format!(" | {}", hint);
-        let seg_len = segment.chars().count();
-        if line.chars().count() + seg_len > width {
-            break;
-        }
-        line.push_str(&segment);
-    }
-    line
-}
-
-fn truncate_with_ellipsis(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-
-    let trimmed = text.trim();
-    let len = trimmed.chars().count();
-    if len <= width {
-        return trimmed.to_string();
-    }
-
-    if width == 1 {
-        return "…".to_string();
-    }
-
-    let mut out: String = trimmed.chars().take(width - 1).collect();
-    out.push('…');
-    out
-}
-
-fn parse_command_parts(command: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut quote: Option<char> = None;
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            '"' | '\'' => {
-                if quote == Some(ch) {
-                    quote = None;
-                } else if quote.is_none() {
-                    quote = Some(ch);
-                } else {
-                    current.push(ch);
-                }
-            }
-            c if c.is_whitespace() && quote.is_none() => {
-                if !current.is_empty() {
-                    parts.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
-        }
-    }
-
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
-}
-
-fn tag_color_idx(tag: &str, len: usize) -> usize {
-    tag.bytes()
-        .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize))
-        % len
-}
-
-fn tag_color_choice_index(key: Option<&str>) -> usize {
-    match key {
-        None | Some("") => 0,
-        Some(key) => TAG_COLOR_CHOICES
-            .iter()
-            .position(|choice| choice.key == key)
-            .map(|idx| idx + 1)
-            .unwrap_or(0),
-    }
-}
-
-fn resolve_tag_colors(theme: ThemeName, tag: &str, color_key: Option<&str>) -> (Color, Color) {
-    if let Some(key) = color_key {
-        if let Some(choice) = theme.tag_color_choices().iter().find(|choice| choice.key == key) {
-            return choice.colors(theme);
-        }
-    }
-
-    let choices = theme.tag_color_choices();
-    choices[tag_color_idx(tag, choices.len())].colors(theme)
-}
-
-fn tag_dot_style(theme: ThemeName, tag: &str, color_key: Option<&str>) -> Style {
-    let (bg, _) = resolve_tag_colors(theme, tag, color_key);
-    Style::default().fg(bg)
-}
-
-///// Returns spans for a rounded pill using Nerd Font powerline glyphs (requires Nerd Font).
-/// `row_bg` should be the background color of the containing row so the caps blend in.
-fn tag_pill_spans(theme: ThemeName, tag: &str, color_key: Option<&str>, row_bg: Color) -> Vec<TSpan<'static>> {
-    let (bg, fg) = resolve_tag_colors(theme, tag, color_key);
-    let cap = Style::default().fg(bg).bg(row_bg);
-    let body = Style::default().bg(bg).fg(fg);
-    vec![
-        TSpan::styled("\u{E0B6}", cap),
-        TSpan::styled(format!("#{} ", tag), body),
-        TSpan::styled("\u{E0B4}", cap),
-    ]
-}
-
-fn color_choice_entry_spans(
-    theme: ThemeName,
-    palette: Palette,
-    choice_idx: Option<usize>,
-    selected_idx: usize,
-) -> Vec<TSpan<'static>> {
-    match choice_idx {
-        None => vec![TSpan::raw("")],
-        Some(0) => {
-            let selected = selected_idx == 0;
-            vec![
-                TSpan::styled(
-                    if selected { "› " } else { "  " },
-                    if selected {
-                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(palette.bg)
-                    },
-                ),
-                TSpan::styled(
-                    "auto",
-                    if selected {
-                        Style::default().fg(palette.accent).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(palette.muted)
-                    },
-                ),
-            ]
-        }
-        Some(idx) => {
-            let choice = TAG_COLOR_CHOICES[idx - 1];
-            let selected = selected_idx == idx;
-            let mut spans = vec![TSpan::styled(
-                if selected { "› " } else { "  " },
-                if selected {
-                    Style::default().fg(choice.colors(theme).0).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(palette.bg)
-                },
-            )];
-            spans.extend(tag_pill_spans(theme, choice.key, Some(choice.key), palette.bg));
-            spans.push(TSpan::styled(
-                format!(" {}", choice.label),
-                if selected {
-                    Style::default().fg(choice.colors(theme).0).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(palette.text)
-                },
-            ));
-            spans
-        }
-    }
-}
-
-fn short_timestamp(ts: &str) -> String {
-    ts.get(0..16).unwrap_or(ts).to_string()
-}
-
-fn is_tag_boundary(c: char) -> bool {
-    !c.is_ascii_alphanumeric() && c != '_' && c != '-'
-}
-
-/// Returns true if the first line of `body` contains `#tag` as a whole tag token.
-fn body_has_tag(body: &str, tag: &str) -> bool {
-    let first_line = body.lines().next().unwrap_or("").to_ascii_lowercase();
-    let needle = format!("#{}", tag);
-    let mut pos = 0;
-    while pos < first_line.len() {
-        if let Some(found) = first_line[pos..].find(&needle) {
-            let abs = pos + found;
-            let after = abs + needle.len();
-            let next_is_continuation = first_line[after..].chars().next()
-                .map(|c| !is_tag_boundary(c))
-                .unwrap_or(false);
-            if !next_is_continuation {
-                return true;
-            }
-            pos = abs + 1;
-        } else {
-            break;
-        }
-    }
-    false
-}
-
-/// Appends ` #tag` to the end of the first line of `body`.
-fn append_tag_to_body(body: &str, tag: &str) -> String {
-    let token = format!(" #{}", tag);
-    match body.find('\n') {
-        Some(nl) => format!("{}{}{}", &body[..nl], token, &body[nl..]),
-        None => format!("{}{}", body, token),
-    }
-}
-
-/// Removes all whole-token occurrences of `#tag` from the first line of `body`.
-fn remove_tag_from_body(body: &str, tag: &str) -> String {
-    let nl = body.find('\n');
-    let first_line = match nl {
-        Some(pos) => &body[..pos],
-        None => body,
-    };
-    let rest = match nl {
-        Some(pos) => &body[pos..],
-        None => "",
-    };
-
-    let needle = format!("#{}", tag);
-    let mut line = first_line.to_string();
-    let mut search_from = 0;
-    loop {
-        let lower = line[search_from..].to_ascii_lowercase();
-        if let Some(found) = lower.find(&needle) {
-            let abs = search_from + found;
-            let after = abs + needle.len();
-            let next_is_continuation = line[after..].chars().next()
-                .map(|c| !is_tag_boundary(c))
-                .unwrap_or(false);
-            if next_is_continuation {
-                search_from = abs + 1;
-                continue;
-            }
-            // Eat a leading space before the token to avoid leaving double spaces
-            let remove_start = if abs > 0 && line.as_bytes()[abs - 1] == b' ' {
-                abs - 1
-            } else {
-                abs
-            };
-            // Or eat a trailing space after the token
-            let remove_end = if line[after..].starts_with(' ') && remove_start == abs {
-                after + 1
-            } else {
-                after
-            };
-            line = format!("{}{}", &line[..remove_start], &line[remove_end..]);
-            search_from = remove_start;
-        } else {
-            break;
-        }
-    }
-
-    format!("{}{}", line, rest)
-}
-
-
-fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    if ranges.is_empty() {
-        return ranges;
-    }
-    ranges.sort_by_key(|&(s, _)| s);
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (s, e) in ranges {
-        if let Some(last) = merged.last_mut() {
-            if s <= last.1 {
-                last.1 = last.1.max(e);
-                continue;
-            }
-        }
-        merged.push((s, e));
-    }
-    merged
-}
-
-fn markdown_highlight_line(line: &str, palette: Palette) -> Vec<(usize, usize, Style)> {
-    let chars: Vec<char> = line.chars().collect();
-    let len = chars.len();
-    if len == 0 {
-        return vec![];
-    }
-
-    let muted_style = Style::default().fg(palette.muted);
-    let accent_style = Style::default().fg(palette.accent).add_modifier(Modifier::BOLD);
-    let ok_style = Style::default().fg(palette.ok);
-
-    // Headings: starts with one or more '#' followed by a space
-    let heading_level: usize = {
-        let mut level = 0;
-        for &c in &chars {
-            if c == '#' { level += 1; } else { break; }
-        }
-        level
-    };
-    if heading_level > 0 && heading_level < len && chars[heading_level] == ' ' {
-        let mut ranges = vec![
-            (0, heading_level + 1, muted_style),            // "## " prefix
-            (heading_level + 1, len, accent_style),          // heading text
-        ];
-        // Remove zero-width range if heading fills the line
-        ranges.retain(|&(s, e, _)| s < e);
-        return ranges;
-    }
-
-    // Horizontal rule: trimmed line is 3+ chars all same (---, ***, ___)
-    {
-        let trimmed: Vec<char> = line.trim().chars().collect();
-        if trimmed.len() >= 3 {
-            let first = trimmed[0];
-            if (first == '-' || first == '*' || first == '_') && trimmed.iter().all(|&c| c == first) {
-                return vec![(0, len, muted_style)];
-            }
-        }
-    }
-
-    // Blockquote: starts with "> "
-    if chars.len() >= 2 && chars[0] == '>' && chars[1] == ' ' {
-        return vec![(0, 2, muted_style)];
-    }
-
-    // List marker: optional whitespace then "- ", "* ", or "+ " followed by text
-    {
-        let mut idx = 0;
-        while idx < chars.len() && chars[idx] == ' ' {
-            idx += 1;
-        }
-        if idx < chars.len()
-            && (chars[idx] == '-' || chars[idx] == '*' || chars[idx] == '+')
-            && idx + 1 < chars.len()
-            && chars[idx + 1] == ' '
-        {
-            // Style the marker (including leading spaces) as accent
-            let marker_end = idx + 2;
-            if marker_end < len {
-                return vec![(0, marker_end, accent_style)];
-            } else {
-                return vec![(0, len, accent_style)];
-            }
-        }
-    }
-
-    // Inline patterns scan (for non-heading, non-special lines)
-    let mut ranges: Vec<(usize, usize, Style)> = Vec::new();
-    let mut i = 0;
-    while i < len {
-        if chars[i] == '`' {
-            // Inline code: find matching backtick
-            let start = i;
-            i += 1;
-            let content_start = i;
-            while i < len && chars[i] != '`' {
-                i += 1;
-            }
-            if i < len {
-                // Found closing backtick
-                let content_end = i;
-                i += 1; // consume closing backtick
-                // Style opening backtick as muted
-                ranges.push((start, start + 1, muted_style));
-                // Style content as ok
-                if content_start < content_end {
-                    ranges.push((content_start, content_end, ok_style));
-                }
-                // Style closing backtick as muted
-                ranges.push((content_end, content_end + 1, muted_style));
-            }
-            // else: no closing backtick found, no special styling
-        } else if chars[i] == '*' {
-            // Check for bold (**...**)
-            if i + 1 < len && chars[i + 1] == '*' {
-                // Bold: find closing **
-                let start = i;
-                i += 2; // skip opening **
-                let content_start = i;
-                let mut found = false;
-                while i + 1 < len {
-                    if chars[i] == '*' && chars[i + 1] == '*' {
-                        found = true;
-                        break;
-                    }
-                    i += 1;
-                }
-                if found {
-                    let content_end = i;
-                    i += 2; // consume closing **
-                    ranges.push((start, start + 2, muted_style)); // opening **
-                    if content_start < content_end {
-                        ranges.push((content_start, content_end, Style::default().add_modifier(Modifier::BOLD)));
-                    }
-                    ranges.push((content_end, content_end + 2, muted_style)); // closing **
-                }
-                // else: no closing **, skip
-            } else {
-                // Italic: single * ... *
-                let start = i;
-                i += 1; // skip opening *
-                let content_start = i;
-                let mut found = false;
-                while i < len {
-                    if chars[i] == '*' && (i + 1 >= len || chars[i + 1] != '*') {
-                        found = true;
-                        break;
-                    }
-                    i += 1;
-                }
-                if found {
-                    let content_end = i;
-                    i += 1; // consume closing *
-                    ranges.push((start, start + 1, muted_style)); // opening *
-                    if content_start < content_end {
-                        ranges.push((content_start, content_end, Style::default().add_modifier(Modifier::ITALIC)));
-                    }
-                    ranges.push((content_end, content_end + 1, muted_style)); // closing *
-                }
-                // else: no closing *, skip
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    ranges
-}
-
-fn build_spans_for_row(
-    visible_chars: &[char],
-    col_offset: usize,
-    lint_ranges: &[(usize, usize)],
-    sel_ranges: &[(usize, usize)],
-    find_ranges: &[(usize, usize)],
-    find_active_ranges: &[(usize, usize)],
-    syn_ranges: &[(usize, usize, Style)],
-    normal: Style,
-    lint: Style,
-    selected: Style,
-    find_match: Style,
-    find_active: Style,
-) -> Vec<TSpan<'static>> {
-    if visible_chars.is_empty() {
-        return vec![];
-    }
-
-    // Categories: 0 = syntax/normal, 1 = lint, 2 = find match, 3 = active find match, 4 = selection (wins all)
-    let mut spans: Vec<TSpan<'static>> = Vec::new();
-    let mut current_text = String::new();
-    let mut current_cat: u8 = 0;
-    let mut current_syn_style: Style = normal;
-
-    for (i, &c) in visible_chars.iter().enumerate() {
-        let abs_col = col_offset + i;
-        let in_sel         = sel_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
-        let in_find_active = find_active_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
-        let in_find        = find_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
-        let in_lint        = lint_ranges.iter().any(|&(s, e)| abs_col >= s && abs_col < e);
-        let cat: u8 = if in_sel { 4 } else if in_find_active { 3 } else if in_find { 2 } else if in_lint { 1 } else { 0 };
-
-        let syn_style = if cat == 0 {
-            syn_ranges
-                .iter()
-                .find(|&&(s, e, _)| abs_col >= s && abs_col < e)
-                .map(|&(_, _, st)| st)
-                .unwrap_or(normal)
-        } else {
-            normal
-        };
-
-        let flush = cat != current_cat || (cat == 0 && syn_style != current_syn_style);
-        if flush {
-            if !current_text.is_empty() {
-                let style = match current_cat {
-                    4 => selected,
-                    3 => find_active,
-                    2 => find_match,
-                    1 => lint,
-                    _ => current_syn_style,
-                };
-                spans.push(TSpan::styled(current_text.clone(), style));
-                current_text.clear();
-            }
-            current_cat = cat;
-            current_syn_style = syn_style;
-        }
-        current_text.push(c);
-    }
-
-    if !current_text.is_empty() {
-        let style = match current_cat {
-            4 => selected,
-            3 => find_active,
-            2 => find_match,
-            1 => lint,
-            _ => current_syn_style,
-        };
-        spans.push(TSpan::styled(current_text, style));
-    }
-
-    spans
-}
-
-fn fix_fences(text: &str) -> String {
-    // CommonMark disallows backticks in a backtick-fence info string.
-    // When the user writes ```lang``` (open+close on one line), strip the
-    // trailing fence so pulldown-cmark sees a valid opening fence.
-    text.lines()
-        .map(|line| {
-            let trimmed = line.trim_end();
-            for fence in &["```", "~~~"] {
-                if trimmed.starts_with(fence) && trimmed.ends_with(fence)
-                    && trimmed.len() > fence.len() * 2
-                {
-                    let stripped = &trimmed[..trimmed.len() - fence.len()];
-                    return format!("{}\n", stripped);
-                }
-            }
-            format!("{}\n", line)
-        })
-        .collect()
-}
-
-fn render_markdown_preview(text: &str, palette: Palette, _width: usize, syntax_set: &SyntaxSet, theme_set: &ThemeSet, highlight_terms: &[String]) -> Text<'static> {
-    let fixed = fix_fences(text);
-    let opts = MdOptions::ENABLE_STRIKETHROUGH | MdOptions::ENABLE_TABLES;
-    let parser = MdParser::new_ext(&fixed, opts);
-
-    let heading_style = Style::default()
-        .fg(palette.accent)
-        .add_modifier(Modifier::BOLD);
-    let h1_style = Style::default()
-        .fg(palette.accent)
-        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    let bold_style = Style::default().add_modifier(Modifier::BOLD);
-    let italic_style = Style::default().add_modifier(Modifier::ITALIC);
-    let code_style = Style::default().fg(palette.ok);
-    let rule_style = Style::default().fg(palette.muted);
-    let normal_style = Style::default().fg(palette.text);
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current_spans: Vec<TSpan<'static>> = Vec::new();
-    let preview_theme = theme_set.themes.get("base16-ocean.dark")
-        .or_else(|| theme_set.themes.values().next());
-
-    let mut in_heading: Option<HeadingLevel> = None;
-    let mut in_bold = false;
-    let mut in_italic = false;
-    let in_code = false;
-    let mut in_code_block = false;
-    let mut code_highlighter: Option<HighlightLines> = None;
-    let mut list_depth: usize = 0;
-    let mut is_list_item = false;
-    let mut list_item_first = false;
-
-    let flush_line = |spans: &mut Vec<TSpan<'static>>, lines: &mut Vec<Line<'static>>| {
-        lines.push(Line::from(std::mem::take(spans)));
-    };
-
-    for event in parser {
-        match event {
-            MdEvent::Start(MdTag::Heading { level, .. }) => {
-                in_heading = Some(level);
-            }
-            MdEvent::End(MdTagEnd::Heading(_)) => {
-                flush_line(&mut current_spans, &mut lines);
-                in_heading = None;
-            }
-            MdEvent::Start(MdTag::Paragraph) => {}
-            MdEvent::End(MdTagEnd::Paragraph) => {
-                flush_line(&mut current_spans, &mut lines);
-                lines.push(Line::from(vec![])); // blank line after paragraph
-            }
-            MdEvent::Start(MdTag::Strong) => in_bold = true,
-            MdEvent::End(MdTagEnd::Strong) => in_bold = false,
-            MdEvent::Start(MdTag::Emphasis) => in_italic = true,
-            MdEvent::End(MdTagEnd::Emphasis) => in_italic = false,
-            MdEvent::Start(MdTag::CodeBlock(kind)) => {
-                in_code_block = true;
-                lines.push(Line::from(vec![]));
-                if let (CodeBlockKind::Fenced(lang_cow), Some(theme)) = (&kind, preview_theme) {
-                    let lang = lang_cow.trim().trim_end_matches('`').trim();
-                    if !lang.is_empty() {
-                        let lower = lang.to_lowercase();
-                        let syntax = syntax_set.find_syntax_by_token(lang)
-                            .or_else(|| syntax_set.syntaxes().iter().find(|s| s.name.to_lowercase() == lower))
-                            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-                        code_highlighter = Some(HighlightLines::new(syntax, theme));
-                    }
-                }
-            }
-            MdEvent::End(MdTagEnd::CodeBlock) => {
-                in_code_block = false;
-                code_highlighter = None;
-                lines.push(Line::from(vec![]));
-            }
-            MdEvent::Code(s) => {
-                let style = code_style;
-                current_spans.push(TSpan::styled(format!("`{}`", s), style));
-            }
-            MdEvent::Start(MdTag::List(_)) => {
-                list_depth += 1;
-            }
-            MdEvent::End(MdTagEnd::List(_)) => {
-                list_depth = list_depth.saturating_sub(1);
-                if list_depth == 0 {
-                    lines.push(Line::from(vec![]));
-                }
-            }
-            MdEvent::Start(MdTag::Item) => {
-                is_list_item = true;
-                list_item_first = true;
-            }
-            MdEvent::End(MdTagEnd::Item) => {
-                flush_line(&mut current_spans, &mut lines);
-                is_list_item = false;
-            }
-            MdEvent::Rule => {
-                lines.push(Line::from(vec![TSpan::styled(
-                    "─".repeat(40),
-                    rule_style,
-                )]));
-            }
-            MdEvent::SoftBreak | MdEvent::HardBreak => {
-                flush_line(&mut current_spans, &mut lines);
-            }
-            MdEvent::Text(s) => {
-                let style = if in_code_block {
-                    code_style
-                } else if let Some(level) = in_heading {
-                    match level {
-                        HeadingLevel::H1 => h1_style,
-                        _ => heading_style,
-                    }
-                } else if in_bold && in_italic {
-                    bold_style.add_modifier(Modifier::ITALIC)
-                } else if in_bold {
-                    bold_style
-                } else if in_italic {
-                    italic_style
-                } else if in_code {
-                    code_style
-                } else {
-                    normal_style
-                };
-
-                if in_code_block {
-                    // Emit each line of the code block separately, with syntect highlighting if available
-                    let lines_vec: Vec<&str> = s.lines().collect();
-                    for (i, line) in lines_vec.iter().enumerate() {
-                        let indent = "  ".repeat(list_depth.max(1).saturating_sub(1) + 1);
-                        if let Some(hl) = code_highlighter.as_mut() {
-                            let line_with_newline = format!("{}\n", line);
-                            if let Ok(tokens) = hl.highlight_line(&line_with_newline, syntax_set) {
-                                current_spans.push(TSpan::raw(indent));
-                                for (syntect_style, token_str) in &tokens {
-                                    let text = token_str.trim_end_matches('\n');
-                                    if !text.is_empty() {
-                                        let fg = syntect_style.foreground;
-                                        let span_style = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
-                                        current_spans.push(TSpan::styled(text.to_string(), span_style));
-                                    }
-                                }
-                            } else {
-                                current_spans.push(TSpan::styled(format!("{}{}", indent, line), code_style));
-                            }
-                        } else {
-                            current_spans.push(TSpan::styled(format!("{}{}", indent, line), code_style));
-                        }
-                        if i + 1 < lines_vec.len() {
-                            flush_line(&mut current_spans, &mut lines);
-                        }
-                    }
-                } else {
-                    let prefix = if is_list_item && list_item_first {
-                        list_item_first = false;
-                        let indent = "  ".repeat(list_depth.saturating_sub(1));
-                        format!("{indent}• ")
-                    } else {
-                        String::new()
-                    };
-                    let display = format!("{}{}", prefix, s);
-                    current_spans.push(TSpan::styled(display, style));
-                }
-            }
-            MdEvent::InlineHtml(_) | MdEvent::Html(_) => {}
-            MdEvent::Start(MdTag::BlockQuote(_)) | MdEvent::End(MdTagEnd::BlockQuote(_)) => {}
-            MdEvent::Start(MdTag::Link { dest_url, .. }) => {
-                current_spans.push(TSpan::styled("[", rule_style));
-                let _ = dest_url;
-            }
-            MdEvent::End(MdTagEnd::Link) => {
-                current_spans.push(TSpan::styled("]", rule_style));
-            }
-            MdEvent::Start(MdTag::Image { .. }) | MdEvent::End(MdTagEnd::Image) => {}
-            MdEvent::Start(MdTag::Table(_)) | MdEvent::End(MdTagEnd::Table) => {
-                flush_line(&mut current_spans, &mut lines);
-            }
-            MdEvent::Start(MdTag::TableHead)
-            | MdEvent::End(MdTagEnd::TableHead)
-            | MdEvent::Start(MdTag::TableRow)
-            | MdEvent::End(MdTagEnd::TableRow) => {
-                flush_line(&mut current_spans, &mut lines);
-            }
-            MdEvent::Start(MdTag::TableCell) => {
-                current_spans.push(TSpan::styled("│ ", rule_style));
-            }
-            MdEvent::End(MdTagEnd::TableCell) => {
-                current_spans.push(TSpan::styled(" ", normal_style));
-            }
-            _ => {}
-        }
-    }
-
-    if !current_spans.is_empty() {
-        lines.push(Line::from(current_spans));
-    }
-
-    // Remove trailing blank lines
-    while lines.last().map_or(false, |l: &Line<'_>| l.spans.is_empty()) {
-        lines.pop();
-    }
-
-    let _ = in_code;
-
-    if highlight_terms.is_empty() {
-        Text::from(lines)
-    } else {
-        Text::from(highlight_preview_lines(lines, highlight_terms, palette))
-    }
-}
-
-fn preview_highlight_terms(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .filter(|token| {
-            !token.starts_with('#')
-                && !token.starts_with('/')
-                && !token.starts_with(':')
-                && !token.is_empty()
-        })
-        .map(|token| token.to_ascii_lowercase())
-        .collect()
-}
-
-fn highlight_preview_lines(lines: Vec<Line<'static>>, terms: &[String], palette: Palette) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .map(|line| {
-            let text: String = line.spans.iter().map(|span| span.content.to_string()).collect();
-            if text.is_empty() {
-                return line;
-            }
-            let lower = text.to_ascii_lowercase();
-            let mut marks = vec![false; lower.chars().count()];
-            let chars: Vec<char> = lower.chars().collect();
-            for term in terms {
-                let tchars: Vec<char> = term.chars().collect();
-                if tchars.is_empty() || tchars.len() > chars.len() {
-                    continue;
-                }
-                for i in 0..=chars.len().saturating_sub(tchars.len()) {
-                    if chars[i..i + tchars.len()] == tchars[..] {
-                        for mark in marks.iter_mut().skip(i).take(tchars.len()) {
-                            *mark = true;
-                        }
-                    }
-                }
-            }
-
-            if !marks.iter().any(|marked| *marked) {
-                return line;
-            }
-
-            let mut spans = Vec::new();
-            let source_chars: Vec<char> = text.chars().collect();
-            let mut current = String::new();
-            let mut current_mark = marks[0];
-            for (idx, ch) in source_chars.iter().enumerate() {
-                if marks[idx] != current_mark {
-                    let style = if current_mark {
-                        Style::default().bg(palette.ok).fg(palette.bg).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(palette.text)
-                    };
-                    spans.push(TSpan::styled(std::mem::take(&mut current), style));
-                    current_mark = marks[idx];
-                }
-                current.push(*ch);
-            }
-            if !current.is_empty() {
-                let style = if current_mark {
-                    Style::default().bg(palette.ok).fg(palette.bg).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(palette.text)
-                };
-                spans.push(TSpan::styled(current, style));
-            }
-            Line::from(spans)
-        })
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
-    use super::{EditorBuffer, normalize_pasted_text};
+    use crate::editor::{EditorBuffer, normalize_pasted_text};
 
     #[test]
     fn insert_and_newline_roundtrip() {
@@ -6079,17 +4948,6 @@ mod tests {
     }
 
     #[test]
-    fn open_line_above_preserves_current_row_position() {
-        let mut buf = EditorBuffer::from_text("one\ntwo".to_string());
-        buf.cursor_row = 1;
-        buf.cursor_col = 1;
-        buf.open_line_above();
-        assert_eq!(buf.to_text(), "one\n\ntwo");
-        assert_eq!(buf.cursor_row, 1);
-        assert_eq!(buf.cursor_col, 0);
-    }
-
-    #[test]
     fn pasted_tabs_expand_to_spaces_from_cursor_column() {
         let mut buf = EditorBuffer::from_text("ab".to_string());
         buf.cursor_col = 2;
@@ -6106,7 +4964,7 @@ mod tests {
 
     #[test]
     fn tag_helpers_add_and_remove() {
-        use super::{body_has_tag, append_tag_to_body, remove_tag_from_body};
+        use crate::render::{body_has_tag, append_tag_to_body, remove_tag_from_body};
 
         assert!(!body_has_tag("hello world", "rust"));
         assert!(body_has_tag("hello #rust world", "rust"));
@@ -6145,7 +5003,8 @@ mod tests {
     #[test]
     fn folder_expand_collapse_roundtrip() {
         use crate::storage::Store;
-        use super::{App, TreeItem};
+        use super::App;
+        use crate::types::TreeItem;
         let store = Store::open_for_test().unwrap();
         store.create_folder("Work").unwrap();
         let id = store.create_note("Note A", "").unwrap();
@@ -6176,7 +5035,8 @@ mod tests {
     #[test]
     fn selected_notes_move_together_down() {
         use crate::storage::Store;
-        use super::{App, TreeItem};
+        use super::App;
+        use crate::types::TreeItem;
 
         let store = Store::open_for_test().unwrap();
         let a = store.create_note("A", "").unwrap();

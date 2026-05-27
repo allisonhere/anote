@@ -34,7 +34,10 @@ impl AppConfig {
 
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("failed reading config {}", path.display()))?;
-        let parsed = toml::from_str::<Self>(&content).unwrap_or_default();
+        let parsed = toml::from_str::<Self>(&content).unwrap_or_else(|e| {
+            eprintln!("warning: config parse error at {}: {} — using defaults", path.display(), e);
+            Self::default()
+        });
         Ok((parsed, path))
     }
 
