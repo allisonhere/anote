@@ -507,7 +507,6 @@ pub fn fix_fences(text: &str) -> String {
 pub fn render_markdown_preview(
     text: &str,
     palette: Palette,
-    _width: usize,
     syntax_set: &SyntaxSet,
     theme_set: &ThemeSet,
     highlight_terms: &[String],
@@ -538,7 +537,6 @@ pub fn render_markdown_preview(
     let mut in_heading: Option<HeadingLevel> = None;
     let mut in_bold = false;
     let mut in_italic = false;
-    let in_code = false;
     let mut in_code_block = false;
     let mut code_highlighter: Option<HighlightLines> = None;
     let mut list_depth: usize = 0;
@@ -636,8 +634,6 @@ pub fn render_markdown_preview(
                     bold_style
                 } else if in_italic {
                     italic_style
-                } else if in_code {
-                    code_style
                 } else {
                     normal_style
                 };
@@ -727,8 +723,6 @@ pub fn render_markdown_preview(
     while lines.last().is_some_and(|l: &Line<'_>| l.spans.is_empty()) {
         lines.pop();
     }
-
-    let _ = in_code;
 
     if highlight_terms.is_empty() {
         Text::from(lines)

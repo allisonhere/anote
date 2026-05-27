@@ -2684,6 +2684,7 @@ impl App {
             }
             "help" => {
                 self.mode = Mode::Help;
+                self.status = "Help: Esc to close".to_string();
             }
             _ => {
                 self.status = format!("Unknown command: {}", command);
@@ -4053,7 +4054,6 @@ if sel_start < sel_end {
             let md_text = render_markdown_preview(
                 &self.editor_buffer.to_text(),
                 palette,
-                editor_layout[1].width as usize,
                 &self.syntax_set,
                 &self.theme_set,
                 &preview_highlight_terms(&self.query),

@@ -712,7 +712,21 @@ fn remove_tag_from_body(body: &str, tag: &str) -> String {
     if cursor < first_line.len() {
         rebuilt.push_str(&first_line[cursor..]);
     }
-    lines[0] = rebuilt.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Collapse consecutive spaces (from tag removal) but preserve single spaces
+    let mut cleaned = String::with_capacity(rebuilt.len());
+    let mut prev_space = false;
+    for ch in rebuilt.trim().chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                cleaned.push(' ');
+                prev_space = true;
+            }
+        } else {
+            cleaned.push(ch);
+            prev_space = false;
+        }
+    }
+    lines[0] = cleaned;
     lines.join("\n")
 }
 
