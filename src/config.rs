@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub density: String,
     pub sort: String,
     pub last_open_note_id: Option<i64>,
+    pub daily_template: String,
 }
 
 impl Default for AppConfig {
@@ -21,6 +22,7 @@ impl Default for AppConfig {
             density: "cozy".to_string(),
             sort: "manual".to_string(),
             last_open_note_id: None,
+            daily_template: "# {date}\n\n## Tasks\n\n## Notes\n".to_string(),
         }
     }
 }

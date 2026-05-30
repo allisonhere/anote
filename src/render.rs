@@ -817,3 +817,113 @@ fn highlight_preview_lines(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_pill_spans_returns_three_spans() {
+        let spans = tag_pill_spans(
+            ThemeName::NeoNoir,
+            "rust",
+            Some("teal"),
+            Color::Rgb(12, 14, 18),
+        );
+        assert_eq!(spans.len(), 3, "pill should have left cap, body, right cap");
+        assert!(spans[1].content.contains("#rust"), "body should contain tag");
+    }
+
+    #[test]
+    fn body_has_tag_positive() {
+        assert!(body_has_tag("hello #rust world", "rust"));
+        assert!(body_has_tag("only #rust", "rust"));
+        assert!(body_has_tag(" #rust ", "rust"));
+    }
+
+    #[test]
+    fn body_has_tag_negative() {
+        assert!(!body_has_tag("hello world", "rust"));
+        assert!(!body_has_tag("hello #rustacean", "rust"));
+        assert!(!body_has_tag("#ru", "rust"));
+    }
+
+    #[test]
+    fn body_has_tag_only_first_line() {
+        assert!(!body_has_tag("first line\n#rust second line", "rust"));
+    }
+
+    #[test]
+    fn body_has_tag_case_insensitive() {
+        assert!(body_has_tag("hello #Rust world", "rust"));
+        assert!(body_has_tag("hello #RUST world", "rust"));
+    }
+
+    #[test]
+    fn append_tag_to_body_single_line() {
+        let body = append_tag_to_body("hello", "rust");
+        assert_eq!(body, "hello #rust");
+        assert!(body_has_tag(&body, "rust"));
+    }
+
+    #[test]
+    fn append_tag_to_body_multi_line() {
+        let body = append_tag_to_body("hello\nbody text", "rust");
+        assert_eq!(body, "hello #rust\nbody text");
+        assert!(body_has_tag(&body, "rust"));
+    }
+
+    #[test]
+    fn remove_tag_from_body_removes_tag() {
+        let result = remove_tag_from_body("hello #rust\nbody", "rust");
+        assert_eq!(result, "hello\nbody");
+        assert!(!body_has_tag(&result, "rust"));
+    }
+
+    #[test]
+    fn remove_tag_from_body_preserves_other_tags() {
+        let result = remove_tag_from_body("notes #rust #work end", "rust");
+        assert!(result.contains("#work"));
+        assert!(!body_has_tag(&result, "rust"));
+    }
+
+    #[test]
+    fn remove_tag_from_body_does_not_affect_prefix_matches() {
+        let result = remove_tag_from_body("notes #rustacean #rust end", "rust");
+        assert!(result.contains("#rustacean"));
+        assert!(!body_has_tag(&result, "rust"));
+    }
+
+    #[test]
+    fn markdown_highlight_line_marks_heading() {
+        let ranges = markdown_highlight_line("## Hello", Palette {
+            bg: Color::Rgb(0, 0, 0),
+            panel: Color::Rgb(0, 0, 0),
+            text: Color::Rgb(255, 255, 255),
+            muted: Color::Rgb(128, 128, 128),
+            accent: Color::Rgb(56, 189, 248),
+            danger: Color::Rgb(255, 0, 0),
+            ok: Color::Rgb(0, 255, 0),
+        });
+        assert!(!ranges.is_empty(), "heading should produce highlight ranges");
+        assert!(ranges[0].0 == 0 || ranges[0].1 > 0);
+    }
+
+    #[test]
+    fn merge_ranges_merges_overlapping() {
+        let merged = merge_ranges(vec![(0, 3), (2, 5), (10, 15)]);
+        assert_eq!(merged, vec![(0, 5), (10, 15)]);
+    }
+
+    #[test]
+    fn merge_ranges_empty_input() {
+        let merged: Vec<(usize, usize)> = merge_ranges(vec![]);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_ranges_single_input() {
+        let merged = merge_ranges(vec![(3, 7)]);
+        assert_eq!(merged, vec![(3, 7)]);
+    }
+}

@@ -101,6 +101,7 @@ pub struct App {
     density: Density,
     sort_mode: SortMode,
     config_path: PathBuf,
+    daily_template: String,
     linter: LintGroup,
     lints: Vec<harper_core::linting::Lint>,
     lints_active: bool,
@@ -172,6 +173,7 @@ impl App {
             density: Density::from_label(&config.density).unwrap_or(Density::Cozy),
             sort_mode: SortMode::from_label(&config.sort).unwrap_or(SortMode::Manual),
             config_path,
+            daily_template: config.daily_template.clone(),
             linter: {
                 let mut lg = LintGroup::new_curated(FstDictionary::curated(), Dialect::American);
                 lg.config.set_rule_enabled("AvoidCurses", false);
@@ -230,7 +232,7 @@ impl App {
         let id = match existing {
             Some(id) => id,
             None => {
-                let body = format!("# {}\n\n## Tasks\n\n## Notes\n", today);
+                let body = self.daily_template.replace("{date}", &today);
                 self.store.create_note_with_title_lock(&today, &body, true)?
             }
         };
@@ -407,6 +409,7 @@ impl App {
             density: self.density.label().to_string(),
             sort: self.sort_mode.label().to_string(),
             last_open_note_id: self.active_note_id,
+            daily_template: self.daily_template.clone(),
         };
         if let Err(err) = config.save(&self.config_path) {
             self.status = format!("Config save failed: {}", err);

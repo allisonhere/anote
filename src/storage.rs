@@ -768,6 +768,7 @@ fn fts_literal_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::Store;
+    use super::parse_query;
 
     #[test]
     fn create_note_extracts_tags_immediately() {
@@ -858,5 +859,90 @@ mod tests {
 
         let tags = store.list_tags().unwrap();
         assert!(tags.iter().all(|entry| entry.tag != "rust"));
+    }
+
+    #[test]
+    fn parse_query_tag_only() {
+        let (tags, folder, archived, trash, fts) = parse_query("#work");
+        assert_eq!(tags, vec!["work"]);
+        assert!(folder.is_none());
+        assert!(!archived);
+        assert!(!trash);
+        assert!(fts.is_empty());
+    }
+
+    #[test]
+    fn parse_query_folder_only() {
+        let (tags, folder, archived, trash, fts) = parse_query("/projects");
+        assert!(tags.is_empty());
+        assert_eq!(folder.as_deref(), Some("projects"));
+        assert!(!archived);
+        assert!(!trash);
+        assert!(fts.is_empty());
+    }
+
+    #[test]
+    fn parse_query_fts_only() {
+        let (tags, folder, archived, trash, fts) = parse_query("rust async");
+        assert!(tags.is_empty());
+        assert!(folder.is_none());
+        assert!(!archived);
+        assert!(!trash);
+        // Each word is wrapped in literal quotes for FTS5
+        assert!(fts.contains("\"rust\""));
+        assert!(fts.contains("\"async\""));
+    }
+
+    #[test]
+    fn parse_query_archived_flag() {
+        let (tags, folder, archived, trash, fts) = parse_query(":archived");
+        assert!(tags.is_empty());
+        assert!(folder.is_none());
+        assert!(archived);
+        assert!(!trash);
+        assert!(fts.is_empty());
+    }
+
+    #[test]
+    fn parse_query_trash_flag() {
+        let (tags, folder, archived, trash, fts) = parse_query(":trash");
+        assert!(tags.is_empty());
+        assert!(folder.is_none());
+        assert!(!archived);
+        assert!(trash);
+        assert!(fts.is_empty());
+    }
+
+    #[test]
+    fn parse_query_combined() {
+        let (tags, folder, archived, trash, fts) =
+            parse_query("#rust /docs :archived async query");
+        assert_eq!(tags, vec!["rust"]);
+        assert_eq!(folder.as_deref(), Some("docs"));
+        assert!(archived);
+        assert!(!trash);
+        assert!(fts.contains("\"async\""));
+        assert!(fts.contains("\"query\""));
+    }
+
+    #[test]
+    fn parse_query_colons_are_literal_text() {
+        // Colons that aren't :archived or :trash should be treated as FTS literals
+        let (tags, folder, archived, trash, fts) = parse_query("context-mode:ctx-stats");
+        assert!(tags.is_empty());
+        assert!(folder.is_none());
+        assert!(!archived);
+        assert!(!trash);
+        assert!(fts.contains("context-mode:ctx-stats"));
+    }
+
+    #[test]
+    fn parse_query_empty_returns_defaults() {
+        let (tags, folder, archived, trash, fts) = parse_query("");
+        assert!(tags.is_empty());
+        assert!(folder.is_none());
+        assert!(!archived);
+        assert!(!trash);
+        assert!(fts.is_empty());
     }
 }
