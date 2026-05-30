@@ -90,6 +90,7 @@ theme   = "neo-noir"   # neo-noir | paper | matrix
 keymap  = "default"    # default | vim
 density = "cozy"       # cozy | compact
 sort    = "manual"     # manual | updated | title
+daily_template = "# {date}\n\n## Tasks\n\n## Notes\n"  # {date} → YYYY-MM-DD
 ```
 
 All fields are optional — missing fields fall back to the defaults above. The config file also stores the last-open note automatically so the TUI can restore your place on startup. Changes to `theme`, `keymap`, and `sort` can also be made at runtime via `:theme <name>`, `:keymap <name>`, and `:sort <mode>` in the command palette.
@@ -119,6 +120,7 @@ All fields are optional — missing fields fall back to the defaults above. The 
 | `:` | power tools / command palette |
 | `\` | toggle notes pane |
 | `Ctrl+P` | quick switcher |
+| `Ctrl+D` | open today's daily note |
 | `g` | browse and manage tags |
 | `x` | toggle note selection |
 | `*` | select all visible notes |
@@ -148,6 +150,7 @@ All fields are optional — missing fields fall back to the defaults above. The 
 |-----|--------|
 | `Esc` | exit to preview |
 | `Ctrl+S` | save |
+| `Ctrl+D` | open today's daily note |
 | `Ctrl+Z` / `Ctrl+Y` | undo / redo |
 | `Ctrl+C` / `Ctrl+X` | copy / cut |
 | `Ctrl+V` | paste from clipboard |
@@ -232,6 +235,7 @@ Navigation phase (after Enter):
 | `:import <path...>` | import file(s) as notes; quote paths with spaces |
 | `:export <path>` | export the current note; quote paths with spaces |
 | `:edit` | open note in editor |
+| `:daily` | open today's daily note |
 | `:folder <name>` | move note to folder (blank = remove) |
 | `:pin` / `:unpin` | pin note to top of list |
 | `:search <query>` | run a search programmatically |
