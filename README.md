@@ -222,7 +222,7 @@ Navigation phase (after Enter):
 | `h` `j` `k` `l` | move cursor |
 | `i` / `a` | enter insert mode |
 | `v` | visual select |
-| `y` / `d` | yank / delete |
+| `y` / `d` | yank / delete (to system clipboard) |
 | `p` / `P` | paste from system clipboard |
 | `u` / `Ctrl+R` | undo / redo |
 | `l` (normal mode) | open selected note from notes pane |

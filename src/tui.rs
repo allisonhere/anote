@@ -16,6 +16,7 @@ use edtui::{
     EditorEventHandler, EditorMode, EditorState as EdtuiState, EditorTheme, EditorView,
     LineNumbers, Lines,
     actions::{Execute, InsertChar},
+    clipboard::Clipboard as EdtuiClipboard,
 };
 use ratatui::{
     widgets::Wrap,
@@ -36,6 +37,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
+use crate::clipboard::SystemClipboard;
 use crate::config::AppConfig;
 use crate::storage::{NoteSummary, Store, TagEntry};
 
@@ -144,7 +146,11 @@ impl App {
             tree_inline_mode: TreeInlineMode::None,
             active_note_id: None,
             editor_buffer: EditorBuffer::new(),
-            editor_state: EdtuiState::new(Lines::from("")),
+            editor_state: {
+                let mut state = EdtuiState::new(Lines::from(""));
+                state.set_clipboard(EdtuiClipboard::new(SystemClipboard));
+                state
+            },
             editor_events: EditorEventHandler::emacs_mode(),
             query: String::new(),
             search_input: String::new(),
@@ -465,8 +471,9 @@ impl App {
             KeymapPreset::Default => EditorMode::Insert,
             KeymapPreset::Vim => self.editor_state.mode,
         };
+        state.set_clipboard(EdtuiClipboard::new(SystemClipboard));
         self.editor_state = state;
-}
+    }
 
     fn sync_editor_buffer_from_state(&mut self) {
         self.editor_buffer = EditorBuffer::from_text(self.editor_state.lines.to_string());
@@ -1584,28 +1591,6 @@ impl App {
             self.mode = Mode::Normal;
             self.selection_anchor = None;
             return Ok(false);
-        }
-
-        // p/P in normal mode: prefer system clipboard over edtui's internal yank buffer
-        if self.editor_state.mode == EditorMode::Normal
-            && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
-            && key.modifiers.is_empty()
-        {
-            let sys = self.clipboard_get().filter(|s| !s.is_empty());
-            if let Some(text) = sys {
-                use edtui::actions::MoveForward;
-                let before = self.editor_state.lines.to_string();
-                if key.code == KeyCode::Char('p') {
-                    // paste after cursor: advance one then insert
-                    MoveForward(1).execute(&mut self.editor_state);
-                }
-                for c in text.chars() {
-                    InsertChar(c).execute(&mut self.editor_state);
-                }
-                self.sync_after_editor_event(before);
-                return Ok(false);
-            }
-            // no system clipboard content — fall through to edtui's p (uses its own yank)
         }
 
         let before = self.editor_state.lines.to_string();
@@ -3076,29 +3061,35 @@ impl App {
     }
 
     fn clipboard_set(&mut self, text: &str) {
-        if let Some(cb) = self.clipboard.as_mut()
-            && cb.set_text(text).is_ok()
+        // Always try shell tools — arboard may return Ok on Wayland
+        // without actually committing to the compositor.
+        let mut ok = false;
+        if let Ok(mut child) = std::process::Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
         {
-            return;
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            ok = child.wait().is_ok_and(|s| s.success());
         }
-        // Fallback: shell clipboard tools
-        let _ = std::process::Command::new("wl-copy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut c| {
-                use std::io::Write;
-                c.stdin.as_mut().map(|s| s.write_all(text.as_bytes()));
-                c.wait()
-            });
-        let _ = std::process::Command::new("xclip")
-            .args(["-sel", "clip"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut c| {
-                use std::io::Write;
-                c.stdin.as_mut().map(|s| s.write_all(text.as_bytes()));
-                c.wait()
-            });
+        if !ok
+            && let Ok(mut child) = std::process::Command::new("xclip")
+                .args(["-sel", "clip"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+        {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+        // Fallback: arboard (reliable on X11, may not commit on Wayland)
+        if let Some(cb) = self.clipboard.as_mut() {
+            let _ = cb.set_text(text);
+        }
     }
 
     fn clipboard_get(&mut self) -> Option<String> {
