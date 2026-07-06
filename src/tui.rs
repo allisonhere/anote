@@ -56,6 +56,7 @@ use crate::render::{
 use crate::utils::{fit_footer_left, fit_footer_segments, parse_command_parts, short_timestamp};
 
 // arboard is optional at runtime (no display server): treat errors as no-op.
+#[cfg(not(target_os = "macos"))]
 use arboard::Clipboard;
 
 
@@ -114,6 +115,7 @@ pub struct App {
     editor_row_height: usize,
     selection_anchor: Option<usize>,
     yank_buffer: String,
+    #[cfg(not(target_os = "macos"))]
     clipboard: Option<Clipboard>,
     undo_stack: Vec<EditorBuffer>,
     redo_stack: Vec<EditorBuffer>,
@@ -194,6 +196,7 @@ impl App {
             editor_row_height: 40,
             selection_anchor: None,
             yank_buffer: String::new(),
+            #[cfg(not(target_os = "macos"))]
             clipboard: Clipboard::new().ok(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -3087,12 +3090,14 @@ impl App {
             let _ = child.wait();
         }
         // Fallback: arboard (reliable on X11, may not commit on Wayland)
+        #[cfg(not(target_os = "macos"))]
         if let Some(cb) = self.clipboard.as_mut() {
             let _ = cb.set_text(text);
         }
     }
 
     fn clipboard_get(&mut self) -> Option<String> {
+        #[cfg(not(target_os = "macos"))]
         if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
             return Some(text);
         }
